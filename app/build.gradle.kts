@@ -16,6 +16,15 @@ android {
         versionName = "1.0"
     }
 
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a")
+            isUniversalApk = true
+        }
+    }
+
     signingConfigs {
         create("esim9") {
             storeFile = file("9eSIMCommunityKey.jks")
