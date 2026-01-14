@@ -7,10 +7,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
-import android.se.omapi.Channel
-import android.se.omapi.SEService
-import android.se.omapi.Session
-import android.se.omapi.Reader
+import ee.nekoko.remocard.omapi.*
 import android.util.Log
 import android.content.Context
 import io.ktor.http.*
@@ -96,9 +93,9 @@ data class SettingsRequest(
 
 class RemoService : Service() {
     private var server: ApplicationEngine? = null
-    private var seService: SEService? = null
-    private val activeSessions = mutableMapOf<String, Session>()
-    private val activeChannels = mutableMapOf<String, Channel>() // Key: "reader:aid"
+    private var smartcardService: SmartcardService? = null
+    private val activeSessions = mutableMapOf<String, SmartcardSession>()
+    private val activeChannels = mutableMapOf<String, SmartcardChannel>() // Key: "reader:aid"
     private val slotEids = mutableMapOf<String, String>() // Key: readerName, Value: EID
     private val slotAids = mutableMapOf<String, String>() // Key: readerName, Value: Supported AID
 
@@ -243,14 +240,14 @@ class RemoService : Service() {
     }
 
     private fun initOmapi() {
-        seService = SEService(this, Executors.newSingleThreadExecutor()) {
+        smartcardService = OmapiManager(this, Executors.newSingleThreadExecutor()) {
             Log.i(TAG, "SE Service connected")
             refreshEids()
-        }
+        }.getService()
     }
 
     private fun refreshEids() {
-        val readers = seService?.readers ?: return
+        val readers = smartcardService?.readers ?: return
         readers.forEach { reader ->
             if (reader.isSecureElementPresent) {
                 try {
@@ -384,8 +381,8 @@ class RemoService : Service() {
 
                     get("/listSlots") {
                         Log.d(TAG, "GET /listSlots")
-                        val readers = seService?.readers ?: emptyArray<Reader>()
-                        val filtered: List<Reader> = if (allowedReaders.isEmpty()) readers.toList() else readers.filter { it.name in allowedReaders }
+                        val readers = smartcardService?.readers ?: emptyArray<SmartcardReader>()
+                        val filtered: List<SmartcardReader> = if (allowedReaders.isEmpty()) readers.toList() else readers.filter { it.name in allowedReaders }
                         val slots = filtered.map { SlotInfo(it.name, it.isSecureElementPresent, slotEids[it.name], slotAids[it.name]) }
                         call.respondMaybeEncrypted(ListSlotsResponse(slots))
                     }
@@ -398,7 +395,7 @@ class RemoService : Service() {
                         try {
                             Log.d(TAG, "POST /openChannel")
                             val req = call.receiveMaybeEncrypted<OpenChannelRequest>()
-                            val readers = seService?.readers ?: emptyArray()
+                            val readers = smartcardService?.readers ?: emptyArray()
                             val reader = if (req.reader != null) readers.find { it.name == req.reader } else readers.firstOrNull()
                             
                             if (reader == null) {
@@ -412,7 +409,7 @@ class RemoService : Service() {
                             }
 
                             val session = activeSessions.getOrPut(reader.name) { reader.openSession() }
-                            var openedChannel: Channel? = null
+                            var openedChannel: SmartcardChannel? = null
                             var matchedAid: String? = null
 
                             for (aid in req.aids) {
@@ -452,7 +449,7 @@ class RemoService : Service() {
                         try {
                             Log.d(TAG, "POST /sendApdu")
                             val req = call.receiveMaybeEncrypted<ApduRequest>()
-                            val readers = seService?.readers ?: emptyArray()
+                            val readers = smartcardService?.readers ?: emptyArray()
                             val readerName = req.reader ?: readers.firstOrNull()?.name ?: ""
                             
                             if (allowedReaders.isNotEmpty() && readerName !in allowedReaders) {
@@ -485,7 +482,7 @@ class RemoService : Service() {
                         try {
                             Log.d(TAG, "POST /sendRawApdu")
                             val req = call.receiveMaybeEncrypted<ApduRequest>()
-                            val readers = seService?.readers ?: emptyArray()
+                            val readers = smartcardService?.readers ?: emptyArray()
                             val readerName = req.reader ?: readers.firstOrNull()?.name ?: ""
                             val reader = readers.find { it.name == readerName }
                             if (reader == null) {
@@ -525,7 +522,7 @@ class RemoService : Service() {
                         try {
                             Log.d(TAG, "POST /closeChannel")
                             val req = call.receiveMaybeEncrypted<OpenChannelRequest>() // reuse aids
-                            val readers = seService?.readers ?: emptyArray()
+                            val readers = smartcardService?.readers ?: emptyArray()
                             val readerName = req.reader ?: readers.firstOrNull()?.name ?: ""
                             
                             req.aids.forEach { aid ->
@@ -568,7 +565,7 @@ class RemoService : Service() {
         }
     }
 
-    private fun transmitWithChunking(channel: Channel, command: ByteArray): ByteArray {
+    private fun transmitWithChunking(channel: SmartcardChannel, command: ByteArray): ByteArray {
         // Bi-directional chunking:
         // 1. Command Chaining (split huge command into multiple APDUs with bit 4 of CLA set)
         // 2. Response Chaining (handle 61XX GET RESPONSE)
@@ -612,7 +609,7 @@ class RemoService : Service() {
         wakeLock?.let { if (it.isHeld) it.release() }
         server?.stop(1000, 2000)
         closeAllChannels()
-        seService?.shutdown()
+        smartcardService?.shutdown()
         unregisterReceiver(simStateReceiver)
         super.onDestroy()
     }

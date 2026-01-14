@@ -10,8 +10,10 @@ import android.graphics.Color
 import android.view.Gravity
 import android.view.View
 import android.os.Build
-import android.se.omapi.SEService
-import android.se.omapi.Reader
+import ee.nekoko.remocard.omapi.*
+import java.net.NetworkInterface
+import java.net.Inet4Address
+import java.util.Collections
 
 class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
@@ -22,7 +24,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var autoStartCheckbox: CheckBox
     private lateinit var readerWhitelistContainer: LinearLayout
     private lateinit var clientsContainer: LinearLayout
-    private var seService: SEService? = null
+    private var smartcardService: SmartcardService? = null
     
     private val uiHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val uiRefreshTask = object : Runnable {
@@ -158,9 +160,9 @@ class MainActivity : AppCompatActivity() {
         layout.addView(clientsContainer)
 
         // Init SE Service to list readers
-        seService = SEService(this, java.util.concurrent.Executors.newSingleThreadExecutor()) {
+        smartcardService = OmapiManager(this, java.util.concurrent.Executors.newSingleThreadExecutor()) {
             runOnUiThread { refreshReaderWhitelist() }
-        }
+        }.getService()
 
         // Add text change listeners for auto-save
         val textWatcher = object : android.text.TextWatcher {
@@ -266,7 +268,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshReaderWhitelist() {
         readerWhitelistContainer.removeAllViews()
-        val readers = seService?.readers ?: emptyArray<Reader>()
+        val readers = smartcardService?.readers ?: emptyArray<SmartcardReader>()
         val prefs = getSharedPreferences("remocard_prefs", Context.MODE_PRIVATE)
         val allowed = prefs.getStringSet("allowed_readers", null) ?: emptySet<String>()
 
@@ -297,12 +299,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun getIPAddresses(): List<String> {
+        val ips = mutableListOf<String>()
+        try {
+            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
+            for (intf in interfaces) {
+                val addrs = Collections.list(intf.inetAddresses)
+                for (addr in addrs) {
+                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                        addr.hostAddress?.let { ips.add(it) }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return ips
+    }
+
     private fun updateUi(running: Boolean) {
         isServiceRunning = running
         val prefs = getSharedPreferences("remocard_prefs", Context.MODE_PRIVATE)
         val port = prefs.getInt("port", 33777)
         if (running) {
-            statusText.text = "Server running on :$port"
+            val ips = getIPAddresses()
+            val ipText = if (ips.isEmpty()) "Unknown IP" else ips.joinToString(", ")
+            statusText.text = "Server running on\n$ipText:$port"
             statusText.setTextColor(Color.parseColor("#4CAF50"))
             actionButton.text = "Stop Server"
             actionButton.setBackgroundColor(Color.parseColor("#E53935"))
@@ -330,7 +352,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         uiHandler.removeCallbacks(uiRefreshTask)
-        seService?.shutdown()
+        smartcardService?.shutdown()
         super.onDestroy()
     }
 }

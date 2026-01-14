@@ -14,6 +14,8 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
         
+        <uses-library android:name="org.simalliance.openmobileapi" android:required="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true">

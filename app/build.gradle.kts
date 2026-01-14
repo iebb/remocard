@@ -10,10 +10,10 @@ android {
 
     defaultConfig {
         applicationId = "ee.nekoko.remocard"
-        minSdk = 28 // Android 9+ for OMAPI
+        minSdk = 21 // Support older devices with SimAlliance
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.1"
+        versionCode = 4
+        versionName = "1.2"
     }
 
     splits {
