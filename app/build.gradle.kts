@@ -12,7 +12,7 @@ android {
         applicationId = "ee.nekoko.remocard"
         minSdk = 21 // Support older devices with SimAlliance
         targetSdk = 34
-        versionCode = 4
+        versionCode = 5
         versionName = "1.2"
     }
 
