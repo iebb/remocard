@@ -12,8 +12,8 @@ android {
         applicationId = "ee.nekoko.remocard"
         minSdk = 28 // Android 9+ for OMAPI
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     splits {
