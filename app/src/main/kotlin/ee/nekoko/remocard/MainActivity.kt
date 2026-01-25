@@ -2,17 +2,17 @@ package ee.nekoko.remocard
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
-import android.widget.*
-import androidx.appcompat.app.AppCompatActivity
-import android.graphics.Color
 import android.view.Gravity
 import android.view.View
-import android.os.Build
+import android.widget.*
+import androidx.appcompat.app.AppCompatActivity
 import ee.nekoko.remocard.omapi.*
-import java.net.NetworkInterface
 import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.util.Collections
 
 class MainActivity : AppCompatActivity() {
@@ -25,125 +25,148 @@ class MainActivity : AppCompatActivity() {
     private lateinit var readerWhitelistContainer: LinearLayout
     private lateinit var clientsContainer: LinearLayout
     private var smartcardService: SmartcardService? = null
-    
+
     private val uiHandler = android.os.Handler(android.os.Looper.getMainLooper())
-    private val uiRefreshTask = object : Runnable {
-        override fun run() {
-            refreshClientList()
-            uiHandler.postDelayed(this, 5000)
-        }
-    }
+    private val uiRefreshTask =
+            object : Runnable {
+                override fun run() {
+                    refreshClientList()
+                    refreshReaderWhitelist()
+                    uiHandler.postDelayed(this, 5000)
+                }
+            }
 
     private var isServiceRunning = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
+
         val prefs = getSharedPreferences("remocard_prefs", Context.MODE_PRIVATE)
 
-        val root = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#121212")) // Dark background
-            isFillViewport = true
-        }
+        val root =
+                ScrollView(this).apply {
+                    setBackgroundColor(Color.parseColor("#121212")) // Dark background
+                    isFillViewport = true
+                }
 
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(64, 48, 64, 64)
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
+        val layout =
+                LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(64, 48, 64, 64)
+                    gravity = Gravity.CENTER_HORIZONTAL
+                }
 
         // Add Header/Title
-        val titleText = TextView(this).apply {
-            text = "RemoCard"
-            textSize = 34f
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setTextColor(Color.parseColor("#FF9800")) // Orange
-            setPadding(0, 32, 0, 8)
-            gravity = Gravity.CENTER
-        }
-        val subtitleText = TextView(this).apply {
-            text = "REMOTE SIM ADAPTER"
-            textSize = 10f
-            letterSpacing = 0.2f
-            setTextColor(Color.parseColor("#FF9800"))
-            setPadding(0, 0, 0, 48)
-            gravity = Gravity.CENTER
-        }
+        val titleText =
+                TextView(this).apply {
+                    text = "RemoCard"
+                    textSize = 34f
+                    typeface = android.graphics.Typeface.DEFAULT_BOLD
+                    setTextColor(Color.parseColor("#FF9800")) // Orange
+                    setPadding(0, 32, 0, 8)
+                    gravity = Gravity.CENTER
+                }
+        val subtitleText =
+                TextView(this).apply {
+                    text = "REMOTE SIM ADAPTER"
+                    textSize = 10f
+                    letterSpacing = 0.2f
+                    setTextColor(Color.parseColor("#FF9800"))
+                    setPadding(0, 0, 0, 48)
+                    gravity = Gravity.CENTER
+                }
         layout.addView(titleText)
         layout.addView(subtitleText)
 
-        statusText = TextView(this).apply {
-            text = "RemoCard Server Offline"
-            textSize = 20f
-            setTextColor(Color.GRAY)
-            setPadding(0, 0, 0, 48)
-            gravity = Gravity.CENTER
-        }
-        
-        actionButton = Button(this).apply {
-            text = "Start Server"
-            setAllCaps(false)
-            textSize = 16f
-            setTextColor(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                setMargins(0, 0, 0, 64)
-            }
-            setOnClickListener {
-                if (isServiceRunning) {
-                    stopRemoService()
-                    updateUi(false)
-                } else {
-                    saveSettings()
-                    startRemoService()
-                    updateUi(true)
+        statusText =
+                TextView(this).apply {
+                    text = "RemoCard Server Offline"
+                    textSize = 20f
+                    setTextColor(Color.GRAY)
+                    setPadding(0, 0, 0, 48)
+                    gravity = Gravity.CENTER
                 }
-            }
-        }
+
+        actionButton =
+                Button(this).apply {
+                    text = "Start Server"
+                    setAllCaps(false)
+                    textSize = 16f
+                    setTextColor(Color.WHITE)
+                    layoutParams =
+                            LinearLayout.LayoutParams(
+                                            LinearLayout.LayoutParams.MATCH_PARENT,
+                                            LinearLayout.LayoutParams.WRAP_CONTENT
+                                    )
+                                    .apply { setMargins(0, 0, 0, 64) }
+                    setOnClickListener {
+                        if (isServiceRunning) {
+                            stopRemoService()
+                            updateUi(false)
+                        } else {
+                            saveSettings()
+                            startRemoService()
+                            updateUi(true)
+                        }
+                    }
+                }
 
         // Settings section
-        val settingsTitle = TextView(this).apply {
-            text = "SERVER SETTINGS"
-            textSize = 12f
-            setTextColor(Color.DKGRAY)
-            setPadding(0, 32, 0, 16)
-        }
+        val settingsTitle =
+                TextView(this).apply {
+                    text = "SERVER SETTINGS"
+                    textSize = 12f
+                    setTextColor(Color.DKGRAY)
+                    setPadding(0, 32, 0, 16)
+                }
 
         portInput = createLabeledInput("Server Port", "33777", InputType.TYPE_CLASS_NUMBER)
         portInput.setText(prefs.getInt("port", 33777).toString())
 
-        passwordInput = createLabeledInput("Connection Password", "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+        passwordInput =
+                createLabeledInput(
+                        "Connection Password",
+                        "",
+                        InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                )
         passwordInput.setText(prefs.getString("password", ""))
 
-        singleChannelCheckbox = createCheckBox("Restrict to Single Channel", prefs.getBoolean("single_channel", false))
+        singleChannelCheckbox =
+                createCheckBox(
+                        "Restrict to Single Channel",
+                        prefs.getBoolean("single_channel", false)
+                )
         singleChannelCheckbox.setOnCheckedChangeListener { _, _ -> saveSettings() }
 
-        autoStartCheckbox = createCheckBox("Auto-start on Boot", prefs.getBoolean("auto_start", true))
+        autoStartCheckbox =
+                createCheckBox("Auto-start on Boot", prefs.getBoolean("auto_start", true))
         autoStartCheckbox.setOnCheckedChangeListener { _, _ -> saveSettings() }
 
-        val whitelistTitle = TextView(this).apply {
-            text = "ALLOWED READERS (Defaults to all if none selected)"
-            textSize = 12f
-            setTextColor(Color.DKGRAY)
-            setPadding(0, 32, 0, 16)
-        }
-        readerWhitelistContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, 32)
-        }
+        val whitelistTitle =
+                TextView(this).apply {
+                    text = "ALLOWED READERS (Defaults to all if none selected)"
+                    textSize = 12f
+                    setTextColor(Color.DKGRAY)
+                    setPadding(0, 32, 0, 16)
+                }
+        readerWhitelistContainer =
+                LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(0, 0, 0, 32)
+                }
 
-        val clientsTitle = TextView(this).apply {
-            text = "CONNECTED CLIENTS (Last 10m)"
-            textSize = 12f
-            setTextColor(Color.parseColor("#FF9800"))
-            setPadding(0, 32, 0, 16)
-        }
-        clientsContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, 32)
-        }
+        val clientsTitle =
+                TextView(this).apply {
+                    text = "CONNECTED CLIENTS (Last 10m)"
+                    textSize = 12f
+                    setTextColor(Color.parseColor("#FF9800"))
+                    setPadding(0, 32, 0, 16)
+                }
+        clientsContainer =
+                LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(0, 0, 0, 32)
+                }
 
         layout.addView(statusText)
         layout.addView(actionButton)
@@ -160,25 +183,40 @@ class MainActivity : AppCompatActivity() {
         layout.addView(clientsContainer)
 
         // Init SE Service to list readers
-        smartcardService = OmapiManager(this, java.util.concurrent.Executors.newSingleThreadExecutor()) {
-            runOnUiThread { refreshReaderWhitelist() }
-        }.getService()
+        smartcardService =
+                OmapiManager(this, java.util.concurrent.Executors.newSingleThreadExecutor()) {
+                            runOnUiThread { refreshReaderWhitelist() }
+                        }
+                        .getService()
 
         // Add text change listeners for auto-save
-        val textWatcher = object : android.text.TextWatcher {
-            override fun afterTextChanged(s: android.text.Editable?) { saveSettings() }
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-        }
+        val textWatcher =
+                object : android.text.TextWatcher {
+                    override fun afterTextChanged(s: android.text.Editable?) {
+                        saveSettings()
+                    }
+                    override fun beforeTextChanged(
+                            s: CharSequence?,
+                            start: Int,
+                            count: Int,
+                            after: Int
+                    ) {}
+                    override fun onTextChanged(
+                            s: CharSequence?,
+                            start: Int,
+                            before: Int,
+                            count: Int
+                    ) {}
+                }
         portInput.addTextChangedListener(textWatcher)
         passwordInput.addTextChangedListener(textWatcher)
 
         root.addView(layout)
         setContentView(root)
-        
+
         // Start UI refresh task
         uiHandler.post(uiRefreshTask)
-        
+
         // Auto-start on launch if enabled
         if (prefs.getBoolean("auto_start", true)) {
             startRemoService()
@@ -186,12 +224,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun createLabel(text: String) = TextView(this).apply {
-        this.text = text
-        textSize = 14f
-        setTextColor(Color.LTGRAY)
-        setPadding(0, 16, 0, 8)
-    }
+    private fun createLabel(text: String) =
+            TextView(this).apply {
+                this.text = text
+                textSize = 14f
+                setTextColor(Color.LTGRAY)
+                setPadding(0, 16, 0, 8)
+            }
 
     private fun createLabeledInput(label: String, hint: String, inputType: Int): EditText {
         return EditText(this).apply {
@@ -203,16 +242,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun createCheckBox(text: String, checked: Boolean) = CheckBox(this).apply {
-        this.text = text
-        this.isChecked = checked
-        setTextColor(Color.LTGRAY)
-        setPadding(0, 24, 0, 24)
-        // Set checkbox tint to orange
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            buttonTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#FF9800"))
-        }
-    }
+    private fun createCheckBox(text: String, checked: Boolean) =
+            CheckBox(this).apply {
+                this.text = text
+                this.isChecked = checked
+                setTextColor(Color.LTGRAY)
+                setPadding(0, 24, 0, 24)
+                // Set checkbox tint to orange
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    buttonTintList =
+                            android.content.res.ColorStateList.valueOf(Color.parseColor("#FF9800"))
+                }
+            }
 
     private fun refreshClientList() {
         if (!::clientsContainer.isInitialized) return
@@ -222,32 +263,39 @@ class MainActivity : AppCompatActivity() {
         val now = System.currentTimeMillis()
 
         if (clients.isEmpty()) {
-            clientsContainer.addView(TextView(this).apply {
-                text = "No active clients"
-                textSize = 13f
-                setTextColor(Color.DKGRAY)
-                gravity = Gravity.CENTER
-            })
+            clientsContainer.addView(
+                    TextView(this).apply {
+                        text = "No active clients"
+                        textSize = 13f
+                        setTextColor(Color.DKGRAY)
+                        gravity = Gravity.CENTER
+                    }
+            )
             return
         }
 
         clients.forEach { (ip, timestamp) ->
             val secondsAgo = (now - timestamp) / 1000
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(0, 16, 0, 16)
-            }
-            val ipText = TextView(this).apply {
-                text = ip
-                weight = 1f
-                setTextColor(Color.WHITE)
-                textSize = 14f
-            }
-            val timeText = TextView(this).apply {
-                text = "${secondsAgo}s ago"
-                setTextColor(if (secondsAgo < 30) Color.parseColor("#4CAF50") else Color.GRAY)
-                textSize = 12f
-            }
+            val row =
+                    LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        setPadding(0, 16, 0, 16)
+                    }
+            val ipText =
+                    TextView(this).apply {
+                        text = ip
+                        weight = 1f
+                        setTextColor(Color.WHITE)
+                        textSize = 14f
+                    }
+            val timeText =
+                    TextView(this).apply {
+                        text = "${secondsAgo}s ago"
+                        setTextColor(
+                                if (secondsAgo < 30) Color.parseColor("#4CAF50") else Color.GRAY
+                        )
+                        textSize = 12f
+                    }
             row.addView(ipText)
             row.addView(timeText)
             clientsContainer.addView(row)
@@ -263,19 +311,70 @@ class MainActivity : AppCompatActivity() {
     private var TextView.weight: Float
         get() = 0f
         set(value) {
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, value)
+            layoutParams =
+                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, value)
         }
 
     private fun refreshReaderWhitelist() {
         readerWhitelistContainer.removeAllViews()
         val readers = smartcardService?.readers ?: emptyArray<SmartcardReader>()
         val prefs = getSharedPreferences("remocard_prefs", Context.MODE_PRIVATE)
-        val allowed = prefs.getStringSet("allowed_readers", null) ?: emptySet<String>()
+        // If "allowed_readers" is missing (null), it means "Allow All"
+        val allowedSet = prefs.getStringSet("allowed_readers", null)
 
         readers.forEach { reader ->
-            val cb = createCheckBox(reader.name, allowed.contains(reader.name))
-            cb.setOnCheckedChangeListener { _, _ -> saveSettings() }
-            readerWhitelistContainer.addView(cb)
+            val row =
+                    LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                    }
+
+            // Defaults to checked if no preference exists
+            val isAllowed = allowedSet == null || allowedSet.contains(reader.name)
+
+            val cb = createCheckBox(reader.name, isAllowed)
+            cb.setOnCheckedChangeListener { _, isChecked -> saveSettings() }
+            cb.setPadding(0, 0, 0, 0)
+
+            val eid = RemoService.slotEids[reader.name]
+            val aid = RemoService.slotAids[reader.name]
+            val error = RemoService.slotErrors[reader.name]
+
+            val statusText =
+                    if (!eid.isNullOrEmpty()) {
+                        " EID: $eid"
+                    } else if (!aid.isNullOrEmpty()) {
+                        " Channel Open"
+                    } else if (!error.isNullOrEmpty()) {
+                        " $error"
+                    } else {
+                        if (isAllowed) " Connecting / No Card" else " Disabled"
+                    }
+
+            val infoText =
+                    TextView(this).apply {
+                        layoutParams =
+                                android.widget.LinearLayout.LayoutParams(
+                                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                                )
+                        text = statusText
+                        textSize = 12f
+                        setTextColor(
+                                if (!error.isNullOrEmpty() ||
+                                                statusText.contains("Error") ||
+                                                statusText.contains("Failed") ||
+                                                statusText.contains("Denied")
+                                )
+                                        Color.RED
+                                else Color.LTGRAY
+                        )
+                        setPadding(16, 0, 0, 0)
+                    }
+
+            row.addView(cb)
+            row.addView(infoText)
+            readerWhitelistContainer.addView(row)
         }
     }
 
@@ -283,9 +382,10 @@ class MainActivity : AppCompatActivity() {
         val prefs = getSharedPreferences("remocard_prefs", Context.MODE_PRIVATE)
         val allowed = mutableSetOf<String>()
         for (i in 0 until readerWhitelistContainer.childCount) {
-            val v = readerWhitelistContainer.getChildAt(i)
-            if (v is CheckBox && v.isChecked) {
-                allowed.add(v.text.toString())
+            val row = readerWhitelistContainer.getChildAt(i) as? android.widget.LinearLayout
+            val cb = row?.getChildAt(0) as? CheckBox
+            if (cb != null && cb.isChecked) {
+                allowed.add(cb.text.toString())
             }
         }
 

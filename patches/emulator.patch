@@ -1,0 +1,2103 @@
+diff --git a/external/qemu/Makefile.android b/external/qemu/Makefile.android
+index 600be7c..b0345cb 100644
+--- a/external/qemu/Makefile.android
++++ b/external/qemu/Makefile.android
+@@ -260,6 +260,8 @@ start-emulator64-program = \
+ # A varient of end-emulator-library for host programs instead
+ end-emulator-program = \
+     $(eval LOCAL_LDLIBS += $(QEMU_SYSTEM_LDLIBS)) \
++    $(eval LOCAL_LDLIBS += -L$(PCSC$(LOCAL_MODULE_BITS)_LIBPATH) -lpcsclite) \
++    $(eval LOCAL_CFLAGS += -DENABLE_PCSC -I$(PCSC_INCPATH)) \
+     $(eval $(end-emulator-module-ev)) \
+     $(call include-if-bitness-$(LOCAL_MODULE_BITS), $(BUILD_HOST_EXECUTABLE))
+ 
+diff --git a/external/qemu/android/cmdline-option.c b/external/qemu/android/cmdline-option.c
+index d24410b..aaca023 100644
+--- a/external/qemu/android/cmdline-option.c
++++ b/external/qemu/android/cmdline-option.c
+@@ -2,6 +2,7 @@
+ #include "android/utils/debug.h"
+ #include "android/utils/misc.h"
+ #include "android/utils/system.h"
++#include "telephony/sim_card.c"
+ #include <stdlib.h>
+ #include <stddef.h>
+ #include <string.h>
+@@ -100,6 +101,20 @@ android_parse_options( int  *pargc, char**  *pargv, AndroidOptions*  opt )
+             continue;
+         }
+ 
++#if defined(ENABLE_PCSC)
++extern void parse_pcsc_options( const char* options );
++
++        if (!strcmp(arg, "pcsc")) {
++            if ((nargs > 0) && (**aread != '-')) {
++                nargs--;
++                parse_pcsc_options(*aread++);
++                continue;
++            }
++            parse_pcsc_options(NULL);
++            continue;
++        }
++#endif
++
+         /* NOTE: variable tables map option names to values
+          * (e.g. field offsets into the AndroidOptions structure).
+          *
+diff --git a/external/qemu/android/console.c b/external/qemu/android/console.c
+index b033c1d..46f8e2b 100644
+--- a/external/qemu/android/console.c
++++ b/external/qemu/android/console.c
+@@ -1544,6 +1544,29 @@ static const CommandDefRec  gsm_commands[] =
+     { NULL, NULL, NULL, NULL, NULL, NULL }
+ };
+ 
++static int
++do_sim_apdu( ControlClient  client, char*  args )
++{
++    char temp[1024];
++
++    if (!args) {
++        control_write( client, "KO: missing argument, try 'sim apdu <apdu>'\r\n" );
++        return -1;
++    }
++    sprintf( temp, "AT+CSIM=%d,\"%s\"", strlen(args), args );
++    amodem_send(android_modem, temp);
++    return 0;
++}
++
++
++static const CommandDefRec  sim_commands[] =
++{
++    { "apdu", "Send APDU to SIM",
++    "'sim apdu' Send APDU to SIM\r\n", NULL,
++    do_sim_apdu, NULL },
++    { NULL, NULL, NULL, NULL, NULL, NULL }
++};
++
+ /********************************************************************************************/
+ /********************************************************************************************/
+ /*****                                                                                 ******/
+@@ -2943,6 +2966,10 @@ static const CommandDefRec   main_commands[] =
+       "allows you to request the emulator sensors\r\n", NULL,
+       NULL, sensor_commands },
+ 
++    { "sim", "SIM related commands",
++      "allows you to send APDUs to the SIM\r\n", NULL,
++      NULL, sim_commands },
++
+     { NULL, NULL, NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/external/qemu/telephony/android_modem.c b/external/qemu/telephony/android_modem.c
+index f9730a3..f23d994 100644
+--- a/external/qemu/telephony/android_modem.c
++++ b/external/qemu/telephony/android_modem.c
+@@ -88,7 +88,7 @@ static int _amodem_set_cdma_prl_version( AModem modem, int prlVersion);
+ #if DEBUG
+ static const char*  quote( const char*  line )
+ {
+-    static char  temp[1024];
++    static char  temp[8 * 0xFFFF];
+     const char*  hexdigits = "0123456789abcdef";
+     char*        p = temp;
+     int          c;
+@@ -274,7 +274,7 @@ typedef struct AModemRec_
+     SmsReceiver         sms_receiver;
+ 
+     int                 out_size;
+-    char                out_buff[1024];
++    char                out_buff[8 * 0xFFFF];
+ 
+     /*
+      * Hold non-volatile ram configuration for modem
+@@ -1436,6 +1436,11 @@ handleSIM_IO( const char*  cmd, AModem  modem )
+     return asimcard_io( modem->sim, cmd );
+ }
+ 
++static const char*
++handleSIM_APDU( const char*  cmd, AModem  modem )
++{
++    return asimcard_cmd( modem->sim, cmd );
++}
+ 
+ static const char*
+ handleOperatorSelection( const char*  cmd, AModem  modem )
+@@ -2431,6 +2436,12 @@ static const struct {
+ 
+     /* see requestSIM_IO() */
+     { "!+CRSM=", NULL, handleSIM_IO },
++    { "!+CSIM=", NULL, handleSIM_APDU },
++    { "!+CGLA=", NULL, handleSIM_APDU },
++    { "!+CCHO=", NULL, handleSIM_APDU },
++    { "!+CCHP=", NULL, handleSIM_APDU },
++    { "!+CCHC=", NULL, handleSIM_APDU },
++    { "!+CATR", NULL, handleSIM_APDU },
+ 
+     /* see onRequest() */
+     { "+CHLD=0", NULL, handleHangup },
+diff --git a/external/qemu/telephony/modem_driver.c b/external/qemu/telephony/modem_driver.c
+index abb302f..9c0c72b 100644
+--- a/external/qemu/telephony/modem_driver.c
++++ b/external/qemu/telephony/modem_driver.c
+@@ -31,7 +31,7 @@ CharDriverState*  android_modem_cs;
+ typedef struct {
+     CharDriverState*  cs;
+     AModem            modem;
+-    char              in_buff[ 1024 ];
++    char              in_buff[ 8 * 0xFFFF ];
+     int               in_pos;
+     int               in_sms;
+ } ModemDriver;
+diff --git a/external/qemu/telephony/sim_card.c b/external/qemu/telephony/sim_card.c
+index b172deb..7bcc9e5 100644
+--- a/external/qemu/telephony/sim_card.c
++++ b/external/qemu/telephony/sim_card.c
+@@ -13,6 +13,20 @@
+ #include <string.h>
+ #include <assert.h>
+ #include <stdio.h>
++#include <stdbool.h>
++#if defined(ENABLE_PCSC)
++#if ! defined(_WIN32)
++#include "pcsclite.h"
++#include "wintypes.h"
++#else
++#define WINSCARDDATA
++#define MAX_BUFFER_SIZE 264
++#endif
++#include "winscard.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include "reader.h"
++#endif
+ 
+ /* set ENABLE_DYNAMIC_RECORDS to 1 to enable dynamic records
+  * for now, this is an experimental feature that needs more testing
+@@ -22,6 +36,10 @@
+ #define  A_SIM_PIN_SIZE  4
+ #define  A_SIM_PUK_SIZE  8
+ 
++#define MAX_N_CHANNELS 20
++#define H_CHANNEL_OFFSET 0x12345600
++#define MAX_APDU_LENGTH 0xFFFF + 10
++
+ typedef struct ASimCardRec_ {
+     ASimStatus  status;
+     char        pin[ A_SIM_PIN_SIZE+1 ];
+@@ -29,15 +47,20 @@ typedef struct ASimCardRec_ {
+     int         pin_retries;
+     int         port;
+ 
+-    char        out_buff[ 256 ];
++    char        out_buff[2 * MAX_APDU_LENGTH];
+     int         out_size;
+ 
++#if defined(ENABLE_PCSC)
++    SCARDCONTEXT hContext;
++    SCARDHANDLE hCard;
++#endif
++
+ } ASimCardRec;
+ 
+ static ASimCardRec  _s_card[1];
+ 
+-ASimCard
+-asimcard_create(int port)
++static ASimCard
++sw_asimcard_create(int port)
+ {
+     ASimCard  card    = _s_card;
+     card->status      = A_SIM_STATUS_READY;
+@@ -48,8 +71,8 @@ asimcard_create(int port)
+     return card;
+ }
+ 
+-void
+-asimcard_destroy( ASimCard  card )
++static void
++sw_asimcard_destroy( ASimCard  card )
+ {
+     /* nothing really */
+     card=card;
+@@ -61,47 +84,47 @@ asimcard_ready( ASimCard  card )
+     return card->status == A_SIM_STATUS_READY;
+ }
+ 
+-ASimStatus
+-asimcard_get_status( ASimCard  sim )
++static ASimStatus
++sw_asimcard_get_status( ASimCard  sim )
+ {
+     return sim->status;
+ }
+ 
+-void
+-asimcard_set_status( ASimCard  sim, ASimStatus  status )
++static void
++sw_asimcard_set_status( ASimCard  sim, ASimStatus  status )
+ {
+     sim->status = status;
+ }
+ 
+-const char*
+-asimcard_get_pin( ASimCard  sim )
++static const char*
++sw_asimcard_get_pin( ASimCard  sim )
+ {
+     return sim->pin;
+ }
+ 
+-const char*
+-asimcard_get_puk( ASimCard  sim )
++static const char*
++sw_asimcard_get_puk( ASimCard  sim )
+ {
+     return sim->puk;
+ }
+ 
+-void
+-asimcard_set_pin( ASimCard  sim, const char*  pin )
++static void
++sw_asimcard_set_pin( ASimCard  sim, const char*  pin )
+ {
+     strncpy( sim->pin, pin, A_SIM_PIN_SIZE );
+     sim->pin_retries = 0;
+ }
+ 
+-void
+-asimcard_set_puk( ASimCard  sim, const char*  puk )
++static void
++sw_asimcard_set_puk( ASimCard  sim, const char*  puk )
+ {
+     strncpy( sim->puk, puk, A_SIM_PUK_SIZE );
+     sim->pin_retries = 0;
+ }
+ 
+ 
+-int
+-asimcard_check_pin( ASimCard  sim, const char*  pin )
++static int
++sw_asimcard_check_pin( ASimCard  sim, const char*  pin )
+ {
+     if (sim->status != A_SIM_STATUS_PIN   &&
+         sim->status != A_SIM_STATUS_READY )
+@@ -121,8 +144,8 @@ asimcard_check_pin( ASimCard  sim, const char*  pin )
+ }
+ 
+ 
+-int
+-asimcard_check_puk( ASimCard  sim, const char* puk, const char*  pin )
++static int
++sw_asimcard_check_puk( ASimCard  sim, const char* puk, const char*  pin )
+ {
+     if (sim->status != A_SIM_STATUS_PUK)
+         return 0;
+@@ -322,8 +345,8 @@ static SimFileEFDedicatedRec  _const_files_dedicated[] =
+ };
+ #endif /* ENABLE_DYNAMIC_RECORDS */
+ 
+-const char*
+-asimcard_io( ASimCard  sim, const char*  cmd )
++static const char*
++sw_asimcard_io( ASimCard  sim, const char*  cmd )
+ {
+     int  nn;
+ #if ENABLE_DYNAMIC_RECORDS
+@@ -445,3 +468,984 @@ asimcard_io( ASimCard  sim, const char*  cmd )
+     return "ERROR: BAD COMMAND";
+ }
+ 
++#if defined(ENABLE_PCSC)
++#if defined(_WIN32)
++WINSCARDDATA const SCARD_IO_REQUEST g_rgSCardT0Pci = {SCARD_PROTOCOL_T0, 8};
++#endif
++
++static SCARD_IO_REQUEST pioSendPci;
++static unsigned char bRecvBuffer[MAX_BUFFER_SIZE], bSendBuffer[MAX_BUFFER_SIZE];
++
++static int pcsc_switch_enabled = 0;
++static char* pcsc_reader = NULL;
++
++void parse_pcsc_options( const char* options )
++{
++    long rv;
++    DWORD dwPref;
++    char *mszReaders;
++    ASimCard  card = _s_card;
++
++    rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &card->hContext);
++    if(rv != SCARD_S_SUCCESS) {
++        printf("sim_card.c: pcscd not found\n");
++        return;
++    }
++
++#ifdef SCARD_AUTOALLOCATE
++    dwPref = SCARD_AUTOALLOCATE;
++    rv = SCardListReaders(card->hContext, NULL, (LPSTR)&mszReaders, &dwPref);
++#else
++    rv = SCardListReaders(card->hContext, NULL, NULL, &dwPref);
++    if(rv != SCARD_S_SUCCESS) {
++        printf("sim_card.c: no card reader found\n");
++        return;
++    }
++    mszReaders = calloc(dwPref, sizeof(char));
++    rv = SCardListReaders(card->hContext, NULL, mszReaders, &dwPref);
++#endif
++
++    if((rv != SCARD_S_SUCCESS) || (strlen(mszReaders) == 0)) {
++        rv = SCardReleaseContext(card->hContext);
++
++        printf("sim_card.c: no card reader found\n");
++        return;
++    }
++
++    if((options != NULL) && (strlen(options) > 0)) {
++        char* reader = mszReaders;
++        while(strlen(reader) > 0) {
++            if(!strncmp(options, reader, strlen(options))) {
++                pcsc_reader = reader;
++                break;
++            }
++            reader += strlen(reader) + 1;
++        }
++    }
++
++    // fallback to first card reader in list
++    if((pcsc_reader == NULL) || (strlen(pcsc_reader) == 0)) {
++        pcsc_reader = mszReaders;
++        while(strlen(mszReaders) > 0) {
++            printf("sim_card.c: %s\n", mszReaders);
++            mszReaders += strlen(mszReaders) + 1;
++        }
++    }
++    pcsc_switch_enabled = 1;
++    printf("sim_card.c: using card reader %s\n", pcsc_reader);
++}
++
++static ASimCard
++pcsc_asimcard_create( int port )
++{
++    long rv;
++    DWORD dwPref, len;
++    ASimCard  card = _s_card;
++    card->status = A_SIM_STATUS_ABSENT;
++    card->pin_retries = 0;
++    card->port = port;
++
++    rv = SCardConnect(card->hContext, pcsc_reader, SCARD_SHARE_SHARED,
++            SCARD_PROTOCOL_T0, &card->hCard, &dwPref);
++    if((rv != SCARD_S_SUCCESS) || (dwPref != SCARD_PROTOCOL_T0)) {
++
++        printf("sim_card.c: failed to open card\n");
++        return card;
++    }
++
++    rv = SCardReconnect(card->hCard, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T0,
++            SCARD_RESET_CARD, &dwPref);
++    if((rv != SCARD_S_SUCCESS) || (dwPref != SCARD_PROTOCOL_T0)) {
++
++        printf("sim_card.c: failed to reset card\n");
++        return card;
++    }
++
++    pioSendPci = *SCARD_PCI_T0;
++
++    // check for DF Telecom
++    memcpy(bSendBuffer, "\xA0\xA4\x00\x00\x02\x7F\x10", 7);
++
++    len = sizeof(bRecvBuffer);
++    rv = SCardTransmit(card->hCard, &pioSendPci, bSendBuffer, 7, NULL,
++            bRecvBuffer, &len);
++    if((dwPref == SCARD_PROTOCOL_T1) && ((rv != SCARD_S_SUCCESS) ||
++       (bRecvBuffer[len-2] != 0x90) || (bRecvBuffer[len-1] != 0x00))) {
++        printf("sim_card.c: sim application not found\n");
++        return card;
++
++    }else if((dwPref != SCARD_PROTOCOL_T1) && ((rv != SCARD_S_SUCCESS) ||
++             (len != 2) || (bRecvBuffer[0] != 0x9F))) {
++              printf("sim_card.c: sim application not found\n");
++              return card;
++    }
++
++    // identify current card status
++    memcpy(bSendBuffer, "\xA0\xA4\x00\x00\x02\x6F\x40", 7);
++
++    len = sizeof(bRecvBuffer);
++    rv = SCardTransmit(card->hCard, &pioSendPci, bSendBuffer, 7, NULL,
++            bRecvBuffer, &len);
++
++    if((dwPref == SCARD_PROTOCOL_T1) && ((rv != SCARD_S_SUCCESS) ||
++       (bRecvBuffer[len-2] != 0x90) || (bRecvBuffer[len-1] != 0x00))) {
++        printf("sim_card.c: sim application not found\n");
++        return card;
++
++    }else if((dwPref != SCARD_PROTOCOL_T1) && ((rv != SCARD_S_SUCCESS) ||
++             (len != 2) || (bRecvBuffer[0] != 0x9F))) {
++              printf("sim_card.c: sim application not found\n");
++              return card;
++    }
++
++    memcpy(bSendBuffer, "\xA0\xB2\x01\x04\xFC", 5);
++
++    len = sizeof(bRecvBuffer);
++    rv = SCardTransmit(card->hCard, &pioSendPci, bSendBuffer, 5, NULL,
++            bRecvBuffer, &len);
++
++    if((rv != SCARD_S_SUCCESS) || (len < 2)) {
++        printf("sim_card.c: sim application not found\n");
++        return card;
++    }
++
++    if((dwPref == SCARD_PROTOCOL_T1) && (bRecvBuffer[len-2] == 0x62)
++       && (bRecvBuffer[len-1] == 0x82)){
++        card->status = A_SIM_STATUS_READY;
++    }
++
++    if(bRecvBuffer[0] == 0x67) {
++        card->status = A_SIM_STATUS_READY;
++    }
++
++    if((bRecvBuffer[0] == 0x98) && (bRecvBuffer[1] == 0x04)) {
++        card->status = A_SIM_STATUS_PIN;
++    }
++
++    // TODO: TERMINAL PROFILE, should be sent by RIL
++    memcpy(bSendBuffer, "\xA0\x10\x00\x00\x14\x3f\xfb\xff\xff\xff\x0f"
++            "\x00\x7f\x7f\x03\xfe\x1f\x23\x05\x14\x86\x07\x00\x00\x00", 25);
++    len = sizeof(bRecvBuffer);
++    SCardTransmit(card->hCard, &pioSendPci, bSendBuffer, 25, NULL,
++            bRecvBuffer, &len);
++
++    // TODO: TERMINAL CAPABILITY, should be sent by RIL
++    memcpy(bSendBuffer, "\x80\xAA\x00\x00\x04\xA9\x02\x81\x00", 9);
++
++    len = sizeof(bRecvBuffer);
++    SCardTransmit(card->hCard, &pioSendPci, bSendBuffer, 9, NULL,
++            bRecvBuffer, &len);
++    return card;
++}
++
++static void
++pcsc_asimcard_destroy( ASimCard  card )
++{
++    long rv;
++
++    rv = SCardDisconnect(card->hCard, SCARD_UNPOWER_CARD);
++    rv = SCardReleaseContext(card->hContext);
++}
++
++static ASimStatus
++pcsc_asimcard_get_status( ASimCard  sim )
++{
++    return sim->status;
++}
++
++static void
++pcsc_asimcard_set_pin( ASimCard  sim, const char*  pin )
++{
++    // TODO
++    sim->pin_retries = 0;
++}
++
++static int
++pcsc_asimcard_check_pin( ASimCard  sim, const char*  pin )
++{
++    long rv;
++    DWORD len;
++
++    if (sim->status != A_SIM_STATUS_PIN   &&
++        sim->status != A_SIM_STATUS_READY )
++        return 0;
++
++    memcpy(bSendBuffer,
++            "\xA0\x20\x00\x01\x08\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF", 13);
++    memcpy(&bSendBuffer[5], pin, strlen(pin));
++
++    len = sizeof(bRecvBuffer);
++    rv = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 13, NULL,
++            bRecvBuffer, &len);
++    if((rv == SCARD_S_SUCCESS) && (len == 2)) {
++
++        if(((bRecvBuffer[0] == 0x90) && (bRecvBuffer[1] == 0x00)) || (bRecvBuffer[0] == 0x91)) {
++
++            sim->status = A_SIM_STATUS_READY;
++            sim->pin_retries = 0;
++            return 1;
++        }
++    }
++
++    if (sim->status != A_SIM_STATUS_READY) {
++        if (++sim->pin_retries == 3)
++            sim->status = A_SIM_STATUS_PUK;
++    }
++    return 0;
++}
++
++static int
++pcsc_asimcard_check_puk( ASimCard  sim, const char* puk, const char*  pin )
++{
++    if (sim->status != A_SIM_STATUS_PUK)
++        return 0;
++
++    // TODO
++
++    if ( ++sim->pin_retries == 6 ) {
++        sim->status = A_SIM_STATUS_ABSENT;
++    }
++    return 0;
++}
++
++static void
++asimcard_bytearray_to_str( char *s, unsigned char b[], int len )
++{
++    int i;
++
++    for(i = 0; i < len; i++)
++        sprintf(&s[i << 1], "%02x", b[i]);
++}
++
++static void
++asimcard_bytearray_to_crsm( char *s, unsigned char b[], int p3 )
++{
++    int i;
++
++    strcpy(s, "+CRSM: ");
++    sprintf(&s[strlen(s)], "%d", b[p3]);
++    strcat(s, ",");
++    sprintf(&s[strlen(s)], "%d", b[p3 + 1]);
++
++    if(p3 == 0)
++        return;
++
++    strcat(s, ",");
++    for(i = 0; i < p3; i++)
++        sprintf(&s[strlen(s)], "%02x", b[i]);
++}
++
++static void
++asimcard_str_to_bytearray( unsigned char b[], char *s )
++{
++    int i;
++
++    for(i = 0; i < (strlen(s) >> 1); i++) {
++        unsigned int bb;
++
++        sscanf(&s[i << 1], "%02x", &bb);
++        b[i] = bb;
++    }
++}
++
++static int
++asimcard_get_channel_number(unsigned char cla)
++{
++    if ((cla & 0x40) == 0x00)
++    {
++        // If b7 = 0, b2b1 encode channel number form 0 to 3
++        return cla & 0x03;
++    }
++    else
++    {
++        // If b7 = 1, b4b3b2b1  encode channel number form 4 to 19
++        return (cla & 0x0F) + 4;
++    }
++}
++
++static bool
++asimcard_is_extended_length_apdu(unsigned char* cmdApdu, int cmdApduLength)
++{
++    return cmdApduLength > 5 && cmdApdu[4] == 0x00;
++}
++
++static int
++pcsc_asimcard_transcieve_apdu(
++            ASimCard sim,
++            unsigned char* cmdApdu,
++            int cmdLength,
++            unsigned char* responseApdu,
++            int responseLength)
++{
++    DWORD len;
++    long rc;
++    unsigned char sw1, sw2;
++
++    if (!asimcard_is_extended_length_apdu(cmdApdu, cmdLength))
++    {
++        memcpy(bSendBuffer, cmdApdu, cmdLength);
++        len = sizeof(bRecvBuffer);
++        rc = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, cmdLength, NULL, bRecvBuffer, &len);
++        if (rc != SCARD_S_SUCCESS || len < 2)
++        {
++            return -1;
++        }
++    }
++    else
++    {
++        // Send extended length APDU, wrap APDU in ENVELOPE commands
++        int channel_number = asimcard_get_channel_number(cmdApdu[0]);
++        if (channel_number < 4)
++        {
++            bSendBuffer[0] = 0x00 | channel_number;
++        }
++        else
++        {
++            bSendBuffer[0] = 0x40 | (channel_number - 4);
++        }
++        memcpy(&bSendBuffer[1], "\xC2\x00\x00", 3);
++        int remainingBytes = cmdLength;
++        while (remainingBytes > 0)
++        {
++            int bytesToSend = remainingBytes;
++            if (bytesToSend > 0xFF)
++            {
++                bytesToSend = 0xFF;
++            }
++            bSendBuffer[4] = bytesToSend;
++            int offset = cmdLength - remainingBytes;
++            memcpy(&bSendBuffer[5], &cmdApdu[offset], bytesToSend);
++            len = sizeof(bRecvBuffer);
++            rc = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 5 + bytesToSend, NULL, bRecvBuffer, &len);
++            if (rc != SCARD_S_SUCCESS || len < 2)
++            {
++                return -1;
++            }
++            sw1 = bRecvBuffer[len - 2];
++            sw2 = bRecvBuffer[len - 1];
++            if (sw1 != 0x90 || sw2 != 0x00)
++            {
++                return -1;
++            }
++            remainingBytes -= bytesToSend;
++        }
++        bSendBuffer[4] = 0x00;
++        len = sizeof(bRecvBuffer);
++        rc = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 5, NULL, bRecvBuffer, &len);
++        if (rc != SCARD_S_SUCCESS || len < 2)
++        {
++            return -1;
++        }
++    }
++
++    sw1 = bRecvBuffer[len - 2];
++    sw2 = bRecvBuffer[len - 1];
++    int pos = 0;
++    if (sw1 == 0x6C) {
++        // Resend the same command with Le = SW2
++        bSendBuffer[4] = bRecvBuffer[1];
++        len = sizeof(bRecvBuffer);
++        rc = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, cmdLength, NULL, bRecvBuffer, &len);
++        if (rc != SCARD_S_SUCCESS || len < 2)
++        {
++            return -1;
++        }
++        sw1 = bRecvBuffer[len - 2];
++        sw2 = bRecvBuffer[len - 1];
++    }
++    while (sw1 == 0x61 || sw2 == 0x9F)
++    {
++        if (len > 2)
++        {
++            // There is data, so save it in return buffer (except SW)
++            if (pos + len > responseLength)
++            {
++                // Not enough space in responseApdu buffer to store data
++                return -2;
++            }
++            memcpy(&responseApdu[pos], bRecvBuffer, len - 2);
++            pos += (len - 2);
++        }
++        // Send a GET RESPONSE command with Le = SW2
++        memcpy(&bSendBuffer[1], "\xC0\x00\x00", 3);
++        bSendBuffer[4] = sw2;
++        len = sizeof(bRecvBuffer);
++        rc = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 5, NULL, bRecvBuffer, &len);
++        if (rc != SCARD_S_SUCCESS || len < 2)
++        {
++            return -1;
++        }
++        sw1 = bRecvBuffer[len - 2];
++        sw2 = bRecvBuffer[len - 1];
++    }
++
++    if (pos + len > responseLength)
++    {
++        return -2;
++    }
++    memcpy(&responseApdu[pos], bRecvBuffer, len);
++    pos += len;
++    return pos;
++}
++
++/**
++ * Wrapper for using pcsc_asimcard_transcieve_apdu withoud need to parse all params.
++ *
++ * @param sim The ASimCard object to be used.
++ * @param command A pointer to the command to be transmitted (as a string).
++ * @param clen The length of the command to be transmitted.
++ * @param channel The channel over which the APDU shall be transmitted.
++ * @param outBuf The buffer where the response shall be stored (initialize with <+CSIM: > or <+CGLA: >).
++ */
++static void
++pcsc_asimcard_transcieve_apdu_wrapper(ASimCard sim, char *command, int clen, int channel, const char* outBuf)
++{
++    unsigned char cmdApdu[MAX_APDU_LENGTH];
++    unsigned char responseApdu[MAX_APDU_LENGTH];
++    long rv;
++    DWORD len;
++
++    if ((strlen(command) != clen) || (((clen >> 1) << 1) != clen))
++    {
++        sprintf(outBuf, "ERROR: BAD COMMAND");
++        return;
++    }
++
++    if (channel < 0  || channel >= MAX_N_CHANNELS)
++    {
++        sprintf(outBuf, "ERROR: INVALID CHANNEL (%d)", channel);
++        return;
++    }
++
++    asimcard_str_to_bytearray(cmdApdu, command);
++
++    if (channel < 4) {
++        cmdApdu[0] &= 0xFC;
++        cmdApdu[0] |= channel;
++    }
++    else {
++        cmdApdu[0] &= 0xF0;
++        cmdApdu[0] |= 0x40 | (channel - 4);
++    }
++
++    rv = pcsc_asimcard_transcieve_apdu(sim, cmdApdu, clen >> 1, responseApdu, sizeof(responseApdu));
++    if (rv < 0)
++    {
++        if (rv == -1)
++        {
++            sprintf(outBuf, "ERROR: SIM FAILURE");
++            return;
++        }
++        else if (rv == -2)
++        {
++            sprintf(outBuf, "ERROR: NOT ENOUGH MEMORY SPACE");
++            return;
++        }
++        else
++        {
++            sprintf(outBuf, "ERROR: UNEXPECTED FAILURE");
++            return;
++        }
++    }
++    sprintf(outBuf, "%d,", (int) rv << 1);
++    asimcard_bytearray_to_str(&outBuf[strlen(outBuf)], responseApdu, rv);
++}
++
++/**
++ * Closes a logical channel.
++ *
++ * @param sim The ASimCard object to be used.
++ * @param channel The channel to be closed.
++ *
++ * @return 0 if close succeeded, <0 otherwise.
++ */
++static long pcsc_asimcard_close_logical_channel(ASimCard sim, int channel)
++{
++    unsigned char cmdApdu[5];
++    unsigned char responseApdu[2];
++    memcpy(cmdApdu, "\x00\x70\x80\x00\x00", 5);
++    cmdApdu[3] = channel;
++    long rv = pcsc_asimcard_transcieve_apdu(sim, cmdApdu, 5, responseApdu, sizeof(responseApdu));
++    if (rv != 2)
++    {
++        return -1;
++    }
++    unsigned char sw1 = responseApdu[rv - 2];
++    unsigned char sw2 = responseApdu[rv - 1];
++    if (sw1 != 0x90 || sw2 != 0x00)
++    {
++        return -1;
++    }
++    return 0;
++}
++
++/**
++ * Opens a logical channel and stores the response in sim->out_buff.
++ * In case of success, response it is stored at the end of the existing string so calling method can
++ * set the name of the AT method at the beggining of sim->out_buff..
++ *
++ * @param sim The ASimCard object to be used.
++ * @param aid The aid to which the channel shall be opened.
++ * @param aidLength The length of the AID.
++ * @param p2 The P2 parameter to be used in the SELECT command.
++ */
++static void
++pcsc_asimcard_open_logical_channel(ASimCard sim, const char *aid, char p2)
++{
++    long rv;
++    unsigned char cmdApdu[21];
++    unsigned char responseApdu[MAX_APDU_LENGTH];
++    int iChannel;
++
++    memcpy(cmdApdu, "\x00\x70\x00\x00\x01", 5);
++    rv = pcsc_asimcard_transcieve_apdu(sim, cmdApdu, 5, responseApdu, sizeof(responseApdu));
++    if (rv < 0)
++    {
++        if (rv == -1)
++        {
++            sprintf(sim->out_buff, "+CME ERROR: SIM FAILURE");
++            return;
++        }
++        else if (rv == -2)
++        {
++            sprintf(sim->out_buff, "+CME ERROR: NOT ENOUGH MEMORY SPACE");
++            return;
++        }
++        else
++        {
++            sprintf(sim->out_buff, "+CME ERROR: UNEXPECTED FAILURE");
++            return;
++        }
++    }
++
++    unsigned char sw1 = responseApdu[rv - 2];
++    unsigned char sw2 = responseApdu[rv - 1];
++    if (rv != 3 || responseApdu[0] <= 0)
++    {
++        // MANAGE CHANNEL (Open) failed
++        sprintf(sim->out_buff, "+CME ERROR: MEMORY FULL");
++        return;
++    }
++
++    iChannel = responseApdu[0];
++
++    if (strlen(aid) > 0)
++    {
++        // Send a SELECT by AID command
++        // Form command:
++        memcpy(cmdApdu, "\x00\xA4\x04\x00", 3);
++        // Set CLA byte
++        if (iChannel < 4)
++        {
++            cmdApdu[0] = iChannel;
++        }
++        else
++        {
++            cmdApdu[0] = 0x40 | (iChannel - 4);
++        }
++        // Set P2 byte
++        cmdApdu[3] = p2;
++        // Set Lc byte
++        cmdApdu[4] = strlen(aid) >> 1;
++        asimcard_str_to_bytearray(&cmdApdu[5], aid);
++
++        // Send the command:
++        rv = pcsc_asimcard_transcieve_apdu(sim, cmdApdu, 5 + cmdApdu[4], responseApdu, sizeof(responseApdu));
++        if (rv < 0)
++        {
++            pcsc_asimcard_close_logical_channel(sim, iChannel);
++            if (rv == -1)
++            {
++                sprintf(sim->out_buff, "+CME ERROR: SIM FAILURE");
++                return;
++            }
++            else if (rv == -2)
++            {
++                sprintf(sim->out_buff, "+CME ERROR: NOT ENOUGH MEMORY SPACE");
++                return;
++            }
++            else
++            {
++                sprintf(sim->out_buff, "+CME ERROR: UNEXPECTED FAILURE");
++                return;
++            }
++        }
++
++        sw1 = responseApdu[rv - 2];
++        sw2 = responseApdu[rv - 1];
++        // Check if select command succeeded
++        if (!(sw1 == 0x90 && sw2 == 0x00) && !(sw1 == 0x62) && !(sw1 == 0x63))
++        {
++            // Something failed, close the channel
++            pcsc_asimcard_close_logical_channel(sim, iChannel);
++            sprintf(sim->out_buff, "+CME ERROR: NOT FOUND");
++            return;
++        }
++    }
++
++    // Form response:
++    // Write the channel number in the out buffer
++    sprintf(&sim->out_buff[strlen(sim->out_buff)], "%d", H_CHANNEL_OFFSET + iChannel);
++    if (strlen(aid) > 0)
++    {
++        // If SELECT cmd was sent, add the select response
++        int i;
++        for (i = 0; i < rv; i++) {
++            sprintf(&sim->out_buff[strlen(sim->out_buff)], ", %d", (int) responseApdu[i]);
++        }
++    }
++}
++
++static const char*
++pcsc_asimcard_cmd( ASimCard  sim, const char*  cmd )
++{
++    int clen, hChannel, iChannel;
++    char command[MAX_APDU_LENGTH * 2];
++
++    // transmit on basic channel:
++    if (sscanf(cmd, "+CSIM=%d,\"%[0-9a-fA-F]", &clen, command) == 2) {
++        sprintf(sim->out_buff, "+CSIM: ");
++        pcsc_asimcard_transcieve_apdu_wrapper(
++                    sim,
++                    command,
++                    clen,
++                    0,
++                    &sim->out_buff[strlen(sim->out_buff)]);
++        return sim->out_buff;
++    }
++
++    // transmit on logical channel:
++    if (sscanf(cmd, "+CGLA=%d,%d,\"%[0-9a-fA-F]", &hChannel, &clen, command) == 3)
++    {
++        sprintf(sim->out_buff, "+CGLA: ");
++        iChannel = hChannel - H_CHANNEL_OFFSET;
++        pcsc_asimcard_transcieve_apdu_wrapper(
++                    sim,
++                    command,
++                    clen,
++                    iChannel,
++                    &sim->out_buff[strlen(sim->out_buff)]);
++        return sim->out_buff;
++    }
++
++    // open logical channel:
++    if (memcmp(cmd, "+CCHO=", 6) == 0 ) {
++        sprintf(sim->out_buff, "+CCHO: ");
++        char *aid;
++        if (sscanf(cmd, "+CCHO=\"%[0-9a-fA-F]", command) == 1) {
++            aid = command;
++        }
++        else {
++            aid = "";
++        }
++        pcsc_asimcard_open_logical_channel(sim, aid, 0x00);
++        return sim->out_buff;
++    }
++
++    // open logical channel with P2:
++    if (memcmp(cmd, "+CCHP=", 6) == 0 ) {
++        sprintf(sim->out_buff, "+CCHP: ");
++        char *aid;
++        char str_p2[10];
++        if (sscanf(cmd, "+CCHP=%[0-9a-fA-F],%[0-9a-fA-F]", command, str_p2) == 2) {
++            aid = command;
++        }
++        else {
++            aid = "";
++        }
++        char p2;
++        asimcard_str_to_bytearray(&p2, str_p2);
++        pcsc_asimcard_open_logical_channel(sim, aid, p2);
++        return sim->out_buff;
++    }
++
++    // close logical channel:
++    if (sscanf(cmd, "+CCHC=%d", &hChannel) == 1) {
++
++        iChannel = hChannel - H_CHANNEL_OFFSET;
++        if(iChannel <= 0  || iChannel >= MAX_N_CHANNELS)
++        {
++            return "+CME ERROR: INCORRECT PARAMETERS";
++        }
++
++        if (pcsc_asimcard_close_logical_channel(sim, iChannel) != 0)
++        {
++            return "+CME ERROR: SIM FAILURE";
++        }
++        return NULL;
++    }
++
++    // get ATR :
++    if (memcmp(cmd, "+CATR", 5) == 0 ) {
++        long rv;
++        DWORD len,dwAtrLen;
++        unsigned char pbAtr[MAX_ATR_SIZE];
++        dwAtrLen = sizeof(pbAtr);
++        rv = SCardGetAttrib(sim->hCard,SCARD_ATTR_ATR_STRING, pbAtr, &dwAtrLen);
++        if(rv == SCARD_S_SUCCESS) {
++            char auxBuf[1024];
++            asimcard_bytearray_to_str(auxBuf, pbAtr,dwAtrLen);
++            sprintf(sim->out_buff, "+CATR: %s", auxBuf);
++            return sim->out_buff;
++        }
++        return "+CME ERROR: ATR NOT FOUND";
++    }
++
++    return "ERROR: BAD COMMAND";
++}
++
++static const char*
++pcsc_asimcard_io( ASimCard  sim, const char*  cmd )
++{
++    int  command, id, p1, p2, p3;
++    char pathid[12];
++    long rv;
++    DWORD len;
++
++    assert( memcmp( cmd, "+CRSM=", 6 ) == 0 );
++	memset( pathid, 0, sizeof(pathid));
++
++    if (sscanf(cmd, "+CRSM=%d,%d,%d,%d,%d", &command, &id, &p1, &p2, &p3) == 5) {
++        // check for pathid.
++        int i = 6, j=0;
++        int delimitercount = 0;
++        unsigned int selects = 0;
++        for( ; i < strlen(cmd); i++ ) {
++            if( cmd[i] == ',' ){
++                delimitercount++;
++                continue;
++            }
++            if( delimitercount == 6 ) { // pathid comes after the 6th delimter
++                pathid[j++] = cmd[i];
++            }
++        }
++
++        unsigned int  str_len = strlen(pathid);
++        if( (str_len % 4) != 0 ){
++            return "ERROR: Invalid path";
++        } else {
++            selects = str_len / 4;
++        }
++
++        unsigned int path[12];
++
++        for (i = 0; i < (str_len / 2); i++) {
++            sscanf(pathid + 2*i, "%02x", &path[i]);
++        }
++
++      // SELECT DF (optional)
++      if(id != 0) {
++        memcpy(bSendBuffer, "\xA0\xA4\x00\x00\x02\x7F\x20", 7);
++        if((id == 0x6F3A) || (id == 0x6F3B) || (id == 0x6F3C) ||
++           (id == 0x6F3D) || (id == 0x6F40) || (id == 0x6F42) ||
++           (id == 0x6F43) || (id == 0x6F44) || (id == 0x6F47) ||
++           (id == 0x6F49) || (id == 0x6F4A) || (id == 0x6F4B) ||
++           (id == 0x6F4C) || (id == 0x6F4D) || (id == 0x6F4E)) {
++
++            path[0] = 0x7F;
++            path[1] = 0x10;
++            selects = 1;
++        } else
++        if((id == 0x2FE2) || (id == 0x2F05) || (id == 0x2F00)) {
++
++            path[0] = 0x3F;
++            path[1] = 0x00;
++            selects = 1;
++        }
++
++        len = sizeof(bRecvBuffer);
++        for( i = 0; i < selects; i++ ) {
++            bSendBuffer[5] = path[2*i];
++            bSendBuffer[6] = path[2*i+1];
++            rv = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 7,
++                    NULL, bRecvBuffer, &len);
++            if((rv != SCARD_S_SUCCESS) || (len != 2) || (bRecvBuffer[0] != 0x9F))
++                return "ERROR: SELECT DF FAILED";
++        }
++      }
++
++      switch (command) {
++        case A_SIM_CMD_GET_RESPONSE:
++          {
++            memcpy(bSendBuffer, "\xA0\xA4\x00\x00\x02\xFF\xFF", 7);
++            bSendBuffer[5] = id >> 8;
++            bSendBuffer[6] = id & 0xff;
++
++            len = sizeof(bRecvBuffer);
++            rv = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 7,
++                    NULL, bRecvBuffer, &len);
++            if((rv == SCARD_S_SUCCESS) && (len == 2) &&
++                    (bRecvBuffer[0] == 0x9F)) {
++
++              memcpy(bSendBuffer, "\xA0\xC0\x00\x00\x0F", 5);
++
++              len = sizeof(bRecvBuffer);
++              rv = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 5,
++                      NULL, bRecvBuffer, &len);
++              if((rv == SCARD_S_SUCCESS) && (len >= 2)) {
++
++                asimcard_bytearray_to_crsm(sim->out_buff, bRecvBuffer, len-2);
++                return sim->out_buff;
++              }
++            }
++
++            return "ERROR: INTERNAL SIM ERROR";
++            break;
++          }
++
++        case A_SIM_CMD_READ_BINARY:
++          {
++            // force EF(AD) content to match settings of MNO (len(MNC) = 3)
++            if((id == 0x6FAD) && (p3 == 4))
++                return "+CRSM: 144,0,00000003";
++
++            memcpy(bSendBuffer, "\xA0\xA4\x00\x00\x02\xFF\xFF", 7);
++            bSendBuffer[5] = id >> 8;
++            bSendBuffer[6] = id & 0xff;
++
++            len = sizeof(bRecvBuffer);
++            rv = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 7,
++                    NULL, bRecvBuffer, &len);
++            if((rv == SCARD_S_SUCCESS) && (len == 2) &&
++                    (bRecvBuffer[0] == 0x9F)) {
++
++              memcpy(bSendBuffer, "\xA0\xB0\x00\x00\xFF", 5);
++              bSendBuffer[3] = p2 & 0xff;
++              bSendBuffer[4] = p3 & 0xff;
++
++              len = sizeof(bRecvBuffer);
++              rv = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 5,
++                      NULL, bRecvBuffer, &len);
++              if((rv == SCARD_S_SUCCESS) && (len >= 2)) {
++
++                asimcard_bytearray_to_crsm(sim->out_buff, bRecvBuffer, len-2);
++                return sim->out_buff;
++              }
++            }
++
++            return "ERROR: INTERNAL SIM ERROR";
++            break;
++          }
++
++        case A_SIM_CMD_READ_RECORD:
++          {
++            memcpy(bSendBuffer, "\xA0\xA4\x00\x00\x02\xFF\xFF", 7);
++            bSendBuffer[5] = id >> 8;
++            bSendBuffer[6] = id & 0xff;
++
++            len = sizeof(bRecvBuffer);
++            rv = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 7,
++                    NULL, bRecvBuffer, &len);
++            if((rv == SCARD_S_SUCCESS) && (len == 2) &&
++                    (bRecvBuffer[0] == 0x9F)) {
++
++              memcpy(bSendBuffer, "\xA0\xB2\xFF\xFF\xFF", 5);
++              bSendBuffer[2] = p1 & 0xff;
++              bSendBuffer[3] = p2 & 0xff;
++              bSendBuffer[4] = p3 & 0xff;
++
++              len = sizeof(bRecvBuffer);
++              rv = SCardTransmit(sim->hCard, &pioSendPci, bSendBuffer, 5,
++                      NULL, bRecvBuffer, &len);
++              if((rv == SCARD_S_SUCCESS) && (len >= 2)) {
++
++                asimcard_bytearray_to_crsm(sim->out_buff, bRecvBuffer, len-2);
++                return sim->out_buff;
++              }
++            }
++
++            return "ERROR: INTERNAL SIM ERROR";
++            break;
++          }
++
++        default:
++          return "ERROR: UNSUPPORTED SIM COMMAND";
++      }
++    }
++    return "ERROR: BAD COMMAND";
++}
++
++#endif /* ENABLE_PCSC */
++
++/* wrapper functions */
++
++ASimCard
++asimcard_create( int port )
++{
++#if defined(ENABLE_PCSC)
++    if (pcsc_switch_enabled)
++        return pcsc_asimcard_create(port);
++#endif
++    return sw_asimcard_create(port);
++}
++
++void
++asimcard_destroy( ASimCard  card )
++{
++#if defined(ENABLE_PCSC)
++    if (pcsc_switch_enabled)
++        return pcsc_asimcard_destroy(card);
++#endif
++    return sw_asimcard_destroy(card);
++}
++
++ASimStatus
++asimcard_get_status( ASimCard  sim )
++{
++#if defined(ENABLE_PCSC)
++    if (pcsc_switch_enabled)
++        return pcsc_asimcard_get_status(sim);
++#endif
++    return sw_asimcard_get_status(sim);
++}
++
++void
++asimcard_set_pin( ASimCard  sim, const char*  pin )
++{
++#if defined(ENABLE_PCSC)
++    if (pcsc_switch_enabled)
++        return pcsc_asimcard_set_pin(sim, pin);
++#endif
++    return sw_asimcard_set_pin(sim, pin);
++}
++
++int
++asimcard_check_pin( ASimCard  sim, const char*  pin )
++{
++#if defined(ENABLE_PCSC)
++    if (pcsc_switch_enabled)
++        return pcsc_asimcard_check_pin(sim, pin);
++#endif
++    return sw_asimcard_check_pin(sim, pin);
++}
++
++int
++asimcard_check_puk( ASimCard  sim, const char* puk, const char*  pin )
++{
++#if defined(ENABLE_PCSC)
++    if (pcsc_switch_enabled)
++        return pcsc_asimcard_check_puk(sim, puk, pin);
++#endif
++    return sw_asimcard_check_puk(sim, puk, pin);
++}
++
++const char*
++asimcard_io( ASimCard  sim, const char*  cmd )
++{
++#if defined(ENABLE_PCSC)
++    if (pcsc_switch_enabled)
++        return pcsc_asimcard_io(sim, cmd);
++#endif
++    return sw_asimcard_io(sim, cmd);
++}
++
++const char*
++asimcard_cmd( ASimCard sim, const char* cmd )
++{
++#if defined(ENABLE_PCSC)
++    if (pcsc_switch_enabled)
++        return pcsc_asimcard_cmd(sim, cmd);
++#endif
++    return "ERROR: UNSUPPORTED COMMAND";
++}
++
+diff --git a/external/qemu/telephony/sim_card.h b/external/qemu/telephony/sim_card.h
+index 1bab1ba..69e033f 100644
+--- a/external/qemu/telephony/sim_card.h
++++ b/external/qemu/telephony/sim_card.h
+@@ -50,5 +50,6 @@ typedef enum {
+ } ASimCommand;
+ 
+ extern const char*  asimcard_io( ASimCard  sim, const char*  cmd );
++extern const char*  asimcard_cmd( ASimCard  sim, const char*  cmd );
+ 
+ #endif /* _android_sim_card_h */
+diff --git a/hardware/ril/include/telephony/ril.h b/hardware/ril/include/telephony/ril.h
+index 6f3338b..7b996c5 100644
+--- a/hardware/ril/include/telephony/ril.h
++++ b/hardware/ril/include/telephony/ril.h
+@@ -100,6 +100,7 @@ typedef enum {
+                                                    illegal SIM or ME */
+     RIL_E_MISSING_RESOURCE = 16,                /* no logical channel available */
+     RIL_E_NO_SUCH_ELEMENT = 17,                 /* application not found on SIM */
++    RIL_E_INVALID_PARAMETER = 18
+ } RIL_Errno;
+ 
+ typedef enum {
+@@ -4089,6 +4090,41 @@ typedef struct {
+  */
+ #define RIL_REQUEST_SHUTDOWN 129
+ 
++/**
++ * RIL_REQUEST_SIM_GET_ATR
++ *
++ * Retrieves the ATR from the UICC.
++ *
++ * "data" is null
++ * "response" is const char * to the ATR.
++ *
++ * Valid errors:
++ *  SUCCESS
++ *  GENERIC_FAILURE
++ */
++#define RIL_REQUEST_SIM_GET_ATR 130
++
++/**
++ * RIL_REQUEST_SIM_OPEN_CHANNEL
++ *
++ * Open a new logical channel and select the given application.
++ *
++ * "data" is const char * and set to AID value, See ETSI 102.221 and 101.220.
++ * "p2" is the p2 byte to set
++ *
++ * "response" is int *
++ * ((int *)data)[0] contains the session id of the logical channel.
++ * ((int *)data)[1] onwards may optionally contain the select response for the
++ *     open channel command with one byte per integer.
++ *
++ * Valid errors:
++ *  SUCCESS
++ *  RADIO_NOT_AVAILABLE
++ *  GENERIC_FAILURE
++ *  MISSING_RESOURCE
++ *  NO_SUCH_ELEMENT
++ */
++#define RIL_REQUEST_SIM_OPEN_CHANNEL_WITH_P2 131
+ 
+ /***********************************************************************/
+ 
+diff --git a/hardware/ril/libril/ril.cpp b/hardware/ril/libril/ril.cpp
+index feaf60f..d7172a3 100644
+--- a/hardware/ril/libril/ril.cpp
++++ b/hardware/ril/libril/ril.cpp
+@@ -69,7 +69,7 @@ namespace android {
+ #define PROPERTY_RIL_IMPL "gsm.version.ril-impl"
+ 
+ // match with constant in RIL.java
+-#define MAX_COMMAND_BYTES (8 * 1024)
++#define MAX_COMMAND_BYTES (8 * 0xFFFF)
+ 
+ // Basically: memset buffers that the client library
+ // shouldn't be using anymore in an attempt to find
+@@ -88,7 +88,7 @@ namespace android {
+ #define RIL_ERRNO_INVALID_RESPONSE -1
+ 
+ // request, response, and unsolicited msg print macro
+-#define PRINTBUF_SIZE 8096
++#define PRINTBUF_SIZE 8 * 0xFFFF
+ 
+ // Enable RILC log
+ #define RILC_LOG 0
+@@ -4660,6 +4660,7 @@ requestToString(int request) {
+         case RIL_REQUEST_IMS_SEND_SMS: return "IMS_SEND_SMS";
+         case RIL_REQUEST_SIM_TRANSMIT_APDU_BASIC: return "SIM_TRANSMIT_APDU_BASIC";
+         case RIL_REQUEST_SIM_OPEN_CHANNEL: return "SIM_OPEN_CHANNEL";
++        case RIL_REQUEST_SIM_OPEN_CHANNEL_WITH_P2: return "SIM_OPEN_CHANNEL_WITH_P2";
+         case RIL_REQUEST_SIM_CLOSE_CHANNEL: return "SIM_CLOSE_CHANNEL";
+         case RIL_REQUEST_SIM_TRANSMIT_APDU_CHANNEL: return "SIM_TRANSMIT_APDU_CHANNEL";
+         case RIL_REQUEST_SET_UICC_SUBSCRIPTION: return "SET_UICC_SUBSCRIPTION";
+@@ -4711,6 +4712,7 @@ requestToString(int request) {
+         case RIL_UNSOL_HARDWARE_CONFIG_CHANGED: return "HARDWARE_CONFIG_CHANGED";
+         case RIL_UNSOL_DC_RT_INFO_CHANGED: return "UNSOL_DC_RT_INFO_CHANGED";
+         case RIL_REQUEST_SHUTDOWN: return "SHUTDOWN";
++        case RIL_REQUEST_SIM_GET_ATR: return "SIM_GET_ATR";
+         default: return "<unknown request>";
+     }
+ }
+diff --git a/hardware/ril/libril/ril_commands.h b/hardware/ril/libril/ril_commands.h
+index 7c3af55..36f5a61 100644
+--- a/hardware/ril/libril/ril_commands.h
++++ b/hardware/ril/libril/ril_commands.h
+@@ -144,3 +144,5 @@
+     {RIL_REQUEST_SET_DC_RT_INFO_RATE, dispatchInts, responseVoid},
+     {RIL_REQUEST_SET_DATA_PROFILE, dispatchDataProfile, responseVoid},
+     {RIL_REQUEST_SHUTDOWN, dispatchVoid, responseVoid},
++    {RIL_REQUEST_SIM_GET_ATR, dispatchVoid, responseString},
++    {RIL_REQUEST_SIM_OPEN_CHANNEL_WITH_P2, dispatchStrings, responseInts},
+diff --git a/hardware/ril/librilutils/record_stream.c b/hardware/ril/librilutils/record_stream.c
+index 558d179..3a834ce 100644
+--- a/hardware/ril/librilutils/record_stream.c
++++ b/hardware/ril/librilutils/record_stream.c
+@@ -46,7 +46,7 @@ extern RecordStream *record_stream_new(int fd, size_t maxRecordLen)
+ {
+     RecordStream *ret;
+ 
+-    assert (maxRecordLen <= 0xffff);
++    assert (maxRecordLen <= 8 * 0xffff);
+ 
+     ret = (RecordStream *)calloc(1, sizeof(RecordStream));
+ 
+diff --git a/hardware/ril/reference-ril/atchannel.c b/hardware/ril/reference-ril/atchannel.c
+index 377dfa8..7d8b21b 100644
+--- a/hardware/ril/reference-ril/atchannel.c
++++ b/hardware/ril/reference-ril/atchannel.c
+@@ -42,7 +42,7 @@
+ 
+ #define NUM_ELEMS(x) (sizeof(x)/sizeof(x[0]))
+ 
+-#define MAX_AT_RESPONSE (8 * 1024)
++#define MAX_AT_RESPONSE (8 * 0xFFFF)
+ #define HANDSHAKE_RETRY_COUNT 8
+ #define HANDSHAKE_TIMEOUT_MSEC 250
+ 
+diff --git a/hardware/ril/reference-ril/reference-ril.c b/hardware/ril/reference-ril/reference-ril.c
+index a3f24c7..9d7e271 100644
+--- a/hardware/ril/reference-ril/reference-ril.c
++++ b/hardware/ril/reference-ril/reference-ril.c
+@@ -46,7 +46,7 @@
+ static void *noopRemoveWarning( void *a ) { return a; }
+ #define RIL_UNUSED_PARM(a) noopRemoveWarning((void *)&(a));
+ 
+-#define MAX_AT_RESPONSE 0x1000
++#define MAX_AT_RESPONSE 8 * 0xFFFF
+ 
+ /* pathname returned from RIL_REQUEST_SETUP_DATA_CALL / RIL_REQUEST_SETUP_DEFAULT_PDP */
+ #define PPP_TTY_PATH "eth0"
+@@ -866,6 +866,9 @@ static void requestSignalStrength(void *data __unused, size_t datalen __unused,
+     int count =0;
+     int numofElements=sizeof(RIL_SignalStrength_v6)/sizeof(int);
+     int response[numofElements];
++    RIL_SIM_IO_Response sr;
++    char *cmd = NULL;
++    int len;
+ 
+     err = at_send_command_singleline("AT+CSQ", "+CSQ:", &p_response);
+ 
+@@ -886,6 +889,57 @@ static void requestSignalStrength(void *data __unused, size_t datalen __unused,
+ 
+     RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
+ 
++sim_status:
++    err = at_send_command_singleline("AT+CSIM=10,\"a0f2000002\"", "+CSIM:",
++            &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        goto sim_error;
++    }
++
++    line = p_response->p_intermediates->line;
++
++    err = at_tok_start(&line);
++    if (err < 0) goto sim_error;
++
++    err = at_tok_nextint(&line, &len);
++    if (err < 0) goto sim_error;
++
++    err = at_tok_nextstr(&line, &(sr.simResponse));
++    if (err < 0) goto sim_error;
++
++    sscanf(&(sr.simResponse[len - 4]), "%02x%02x", &(sr.sw1), &(sr.sw2));
++    sr.simResponse[len - 4] = '\0';
++
++    if(sr.sw1 != 0x91)
++        goto sim_error;
++
++sim_fetch:
++    asprintf(&cmd, "AT+CSIM=10,\"a0120000%02x\"", sr.sw2);
++    err = at_send_command_singleline(cmd, "+CSIM:", &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        goto sim_error;
++    }
++
++    line = p_response->p_intermediates->line;
++
++    err = at_tok_start(&line);
++    if (err < 0) goto sim_error;
++
++    err = at_tok_nextint(&line, &len);
++    if (err < 0) goto sim_error;
++
++    err = at_tok_nextstr(&line, &(sr.simResponse));
++    if (err < 0) goto sim_error;
++
++    sscanf(&(sr.simResponse[len - 4]), "%02x%02x", &(sr.sw1), &(sr.sw2));
++    sr.simResponse[len - 4] = '\0';
++
++    RIL_onUnsolicitedResponse(RIL_UNSOL_STK_PROACTIVE_COMMAND, sr.simResponse,
++            strlen(sr.simResponse));
++sim_error:
++    if (cmd != NULL) free(cmd);
+     at_response_free(p_response);
+     return;
+ 
+@@ -1789,6 +1843,7 @@ static void  requestSIM_IO(void *data, size_t datalen __unused, RIL_Token t)
+     char *cmd = NULL;
+     RIL_SIM_IO_v6 *p_args;
+     char *line;
++    int len;
+ 
+     memset(&sr, 0, sizeof(sr));
+ 
+@@ -1797,13 +1852,49 @@ static void  requestSIM_IO(void *data, size_t datalen __unused, RIL_Token t)
+     /* FIXME handle pin2 */
+ 
+     if (p_args->data == NULL) {
+-        asprintf(&cmd, "AT+CRSM=%d,%d,%d,%d,%d",
+-                    p_args->command, p_args->fileid,
+-                    p_args->p1, p_args->p2, p_args->p3);
++        if (p_args->path == NULL) {
++            asprintf(
++                &cmd,
++                "AT+CRSM=%d,%d,%d,%d,%d",
++                p_args->command,
++                p_args->fileid,
++                p_args->p1,
++                p_args->p2,
++                p_args->p3);
++        } else {
++            asprintf(
++                &cmd,
++                "AT+CRSM=%d,%d,%d,%d,%d,,%s",
++                p_args->command,
++                p_args->fileid,
++                p_args->p1,
++                p_args->p2,
++                p_args->p3,
++                p_args->path);
++        }
+     } else {
+-        asprintf(&cmd, "AT+CRSM=%d,%d,%d,%d,%d,%s",
+-                    p_args->command, p_args->fileid,
+-                    p_args->p1, p_args->p2, p_args->p3, p_args->data);
++        if (p_args->path == NULL) {
++            asprintf(
++                &cmd,
++                "AT+CRSM=%d,%d,%d,%d,%d,%s",
++                p_args->command,
++                p_args->fileid,
++                p_args->p1,
++                p_args->p2,
++                p_args->p3,
++                p_args->data);
++        } else {
++            asprintf(
++                &cmd,
++                "AT+CRSM=%d,%d,%d,%d,%d,%s,%s",
++                p_args->command,
++                p_args->fileid,
++                p_args->p1,
++                p_args->p2,
++                p_args->p3,
++                p_args->data,
++                p_args->path);
++        }
+     }
+ 
+     err = at_send_command_singleline(cmd, "+CRSM:", &p_response);
+@@ -1832,12 +1923,457 @@ static void  requestSIM_IO(void *data, size_t datalen __unused, RIL_Token t)
+     at_response_free(p_response);
+     free(cmd);
+ 
+-    return;
++    // return if no sim toolkit proactive command is ready
++    if(sr.sw1 != 0x91)
++        return;
++
++fetch:
++    asprintf(&cmd, "AT+CSIM=10,\"a0120000%02x\"", sr.sw2);
++    err = at_send_command_singleline(cmd, "+CSIM:", &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        goto fetch_error;
++    }
++
++    line = p_response->p_intermediates->line;
++
++    err = at_tok_start(&line);
++    if (err < 0) goto fetch_error;
++
++    err = at_tok_nextint(&line, &len);
++    if (err < 0) goto fetch_error;
++
++    err = at_tok_nextstr(&line, &(sr.simResponse));
++    if (err < 0) goto fetch_error;
++
++    sscanf(&(sr.simResponse[len - 4]), "%02x%02x", &(sr.sw1), &(sr.sw2));
++    sr.simResponse[len - 4] = '\0';
++
++    RIL_onUnsolicitedResponse(RIL_UNSOL_STK_PROACTIVE_COMMAND, sr.simResponse, strlen(sr.simResponse));
++
++    goto fetch_error;
++
+ error:
+     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
++fetch_error:
++    at_response_free(p_response);
++    free(cmd);
++
++}
++
++static void  requestSIM_OpenChannel(void *data, size_t datalen, RIL_Token t)
++{
++    ATResponse *p_response = NULL;
++    int err;
++    char *cmd = NULL;
++    char *line;
++    // TODO: dinamically allocate the buffer depending on response length
++    int response[257];
++    int response_length = 1;
++
++    asprintf(&cmd, "AT+CCHO=\"%s\"", (char *)data);
++    err = at_send_command_singleline(cmd, "+CCHO:", &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        if (!strcmp(p_response->finalResponse, "+CME ERROR: MEMORY FULL")) {
++            err = RIL_E_MISSING_RESOURCE;
++        }
++        else if (!strcmp(p_response->finalResponse, "+CME ERROR: NOT FOUND")) {
++            err = RIL_E_NO_SUCH_ELEMENT;
++        }
++        else {
++            err = RIL_E_GENERIC_FAILURE;
++        }
++        goto error;
++    }
++
++    line = p_response->p_intermediates->line;
++
++    err = at_tok_start(&line);
++    if (err < 0) goto error;
++
++    // Read channel number
++    err = at_tok_nextint(&line, &response[0]);
++    if (err < 0) goto error;
++
++    // Read select response (if available)
++    while (at_tok_hasmore(&line)) {
++        err = at_tok_nextint(&line, &response[response_length]);
++        if (err < 0) goto error;
++        response_length++;
++    }
++    // Check that length == 1 (select response not present) or > 3 (valid APDU as select response)
++    if (response_length != 1 && response_length < 3) {
++        err = RIL_E_GENERIC_FAILURE;
++        RLOGE("Invalid select response (length = %d)", response_length - 1);
++        goto error;
++    }
++
++    RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, response_length * sizeof(int));
++    at_response_free(p_response);
++    free(cmd);
++
++    return;
++error:
++    RIL_onRequestComplete(t, err, NULL, 0);
++    at_response_free(p_response);
++    free(cmd);
++}
++
++static void  requestSIM_OpenChannel_WITH_P2(void *data, size_t datalen, RIL_Token t)
++{
++    ATResponse *p_response = NULL;
++    int err;
++    char *cmd = NULL;
++    const char**  strings = (const char**)data;;
++    char *line;
++    // TODO: dinamically allocate the buffer depending on response length
++    int response[257];
++    int response_length = 1;
++    asprintf(&cmd, "AT+CCHP=%s,%s", strings[0], strings[1]);
++    err = at_send_command_singleline(cmd, "+CCHP:", &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        if (!strcmp(p_response->finalResponse, "+CME ERROR: MEMORY FULL")) {
++            err = RIL_E_MISSING_RESOURCE;
++        }
++        else if (!strcmp(p_response->finalResponse, "+CME ERROR: NOT FOUND")) {
++            err = RIL_E_NO_SUCH_ELEMENT;
++        }
++        else {
++            err = RIL_E_GENERIC_FAILURE;
++        }
++        goto error;
++    }
++
++    line = p_response->p_intermediates->line;
++
++    err = at_tok_start(&line);
++    if (err < 0) goto error;
++
++    // Read channel number
++    err = at_tok_nextint(&line, &response[0]);
++    if (err < 0) goto error;
++
++    // Read select response (if available)
++    while (at_tok_hasmore(&line)) {
++        err = at_tok_nextint(&line, &response[response_length]);
++        if (err < 0) goto error;
++        response_length++;
++    }
++    // Check that length == 1 (select response not present) or > 3 (valid APDU as select response)
++    if (response_length != 1 && response_length < 3) {
++        err = RIL_E_GENERIC_FAILURE;
++        RLOGE("Invalid select response (length = %d)", response_length - 1);
++        goto error;
++    }
++
++    RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, response_length * sizeof(int));
++    at_response_free(p_response);
++    free(cmd);
++
++    return;
++error:
++    RLOGE("strings error!");
++    RIL_onRequestComplete(t, err, NULL, 0);
++    at_response_free(p_response);
++    free(cmd);
++}
++
++static void  requestSIM_CloseChannel(void *data, size_t datalen, RIL_Token t)
++{
++    ATResponse *p_response = NULL;
++    int err;
++    char *cmd = NULL;
++    char *line;
++    int channel;
++
++    asprintf(&cmd, "AT+CCHC=%d", *(int *)data);
++    err = at_send_command(cmd, &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        if (!strcmp(p_response->finalResponse, "+CME ERROR: INCORRECT PARAMETERS")) {
++            err = RIL_E_INVALID_PARAMETER;
++        }
++        else {
++            err = RIL_E_GENERIC_FAILURE;
++        }
++        goto error;
++    }
++
++    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
++    at_response_free(p_response);
++    free(cmd);
++
++    return;
++error:
++    RIL_onRequestComplete(t, err, NULL, 0);
++    at_response_free(p_response);
++    free(cmd);
++}
++
++static void  requestSIM_TransmitBasic(void *data, size_t datalen, RIL_Token t)
++{
++    ATResponse *p_response = NULL;
++    RIL_SIM_IO_Response sr;
++    int err;
++    char *cmd = NULL;
++    RIL_SIM_APDU *p_args;
++    char *line;
++    int len;
++
++    memset(&sr, 0, sizeof(sr));
++
++    p_args = (RIL_SIM_APDU *) data;
++
++    if ((p_args->data == NULL) || (strlen(p_args->data) == 0)) {
++        if (p_args->p3 < 0) {
++            asprintf(
++                &cmd,
++                "AT+CSIM=%d,\"%02x%02x%02x%02x\"",
++                8,
++                p_args->cla,
++                p_args->instruction,
++                p_args->p1,
++                p_args->p2);
++        } else {
++            asprintf(
++                &cmd,
++                "AT+CSIM=%d,\"%02x%02x%02x%02x%02x\"",
++                10,
++                p_args->cla,
++                p_args->instruction,
++                p_args->p1,
++                p_args->p2,
++                p_args->p3);
++        }
++    } else {
++        asprintf(
++            &cmd,
++            "AT+CSIM=%d,\"%02x%02x%02x%02x%02x%s\"",
++            10 + strlen(p_args->data),
++            p_args->cla,
++            p_args->instruction,
++            p_args->p1,
++            p_args->p2,
++            p_args->p3,
++            p_args->data);
++    }
++    err = at_send_command_singleline(cmd, "+CSIM:", &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        goto error;
++    }
++
++    line = p_response->p_intermediates->line;
++
++    err = at_tok_start(&line);
++    if (err < 0) goto error;
++
++    err = at_tok_nextint(&line, &len);
++    if (err < 0) goto error;
++
++    err = at_tok_nextstr(&line, &(sr.simResponse));
++    if (err < 0) goto error;
++
++    sscanf(&(sr.simResponse[len - 4]), "%02x%02x", &(sr.sw1), &(sr.sw2));
++    sr.simResponse[len - 4] = '\0';
++
++    RIL_onRequestComplete(t, RIL_E_SUCCESS, &sr, sizeof(sr));
++    at_response_free(p_response);
++    free(cmd);
++
++    // end sim toolkit session if 90 00 on TERMINAL RESPONSE
++    if((p_args->instruction == 20) && (sr.sw1 == 0x90))
++        RIL_onUnsolicitedResponse(RIL_UNSOL_STK_SESSION_END, NULL, 0);
++
++    // return if no sim toolkit proactive command is ready
++    if(sr.sw1 != 0x91)
++        return;
++
++fetch:
++    asprintf(&cmd, "AT+CSIM=10,\"a0120000%02x\"", sr.sw2);
++    err = at_send_command_singleline(cmd, "+CSIM:", &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        goto fetch_error;
++    }
++
++    line = p_response->p_intermediates->line;
++
++    err = at_tok_start(&line);
++    if (err < 0) goto fetch_error;
++
++    err = at_tok_nextint(&line, &len);
++    if (err < 0) goto fetch_error;
++
++    err = at_tok_nextstr(&line, &(sr.simResponse));
++    if (err < 0) goto fetch_error;
++
++    sscanf(&(sr.simResponse[len - 4]), "%02x%02x", &(sr.sw1), &(sr.sw2));
++    sr.simResponse[len - 4] = '\0';
++
++    RIL_onUnsolicitedResponse(RIL_UNSOL_STK_PROACTIVE_COMMAND, sr.simResponse, strlen(sr.simResponse));
++
++    goto fetch_error;
++error:
++   RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
++fetch_error:
++   at_response_free(p_response);
++   free(cmd);
++}
++
++static void  requestSIM_TransmitChannel(void *data, size_t datalen, RIL_Token t)
++{
++    ATResponse *p_response = NULL;
++    RIL_SIM_IO_Response sr;
++    int err;
++    char *cmd = NULL;
++    RIL_SIM_APDU *p_args;
++    char *line;
++    int len;
++
++    memset(&sr, 0, sizeof(sr));
++
++    p_args = (RIL_SIM_APDU *)data;
++
++    if ((p_args->data == NULL) || (strlen(p_args->data) == 0)) {
++        if (p_args->p3 < 0) {
++            asprintf(
++                &cmd,
++                "AT+CGLA=%d,%d,\"%02x%02x%02x%02x\"",
++                p_args->sessionid,
++                8,
++                p_args->cla,
++                p_args->instruction,
++                p_args->p1,
++                p_args->p2);
++        } else {
++            asprintf(
++                &cmd,
++                "AT+CGLA=%d,%d,\"%02x%02x%02x%02x%02x\"",
++                p_args->sessionid,
++                10,
++                p_args->cla,
++                p_args->instruction,
++                p_args->p1,
++                p_args->p2,
++                p_args->p3);
++        }
++    } else {
++        asprintf(
++            &cmd,
++            "AT+CGLA=%d,%d,\"%02x%02x%02x%02x%02x%s\"",
++            p_args->sessionid,
++            10 + strlen(p_args->data),
++            p_args->cla,
++            p_args->instruction,
++            p_args->p1,
++            p_args->p2,
++            p_args->p3,
++            p_args->data);
++    }
++
++    err = at_send_command_singleline(cmd, "+CGLA:", &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        if (!strcmp(p_response->finalResponse, "+CME ERROR: INCORRECT PARAMETERS")) {
++            err = RIL_E_INVALID_PARAMETER;
++        }
++        else {
++            err = RIL_E_GENERIC_FAILURE;
++        }
++        goto error;
++    }
++
++    line = p_response->p_intermediates->line;
++
++    if (at_tok_start(&line) < 0
++            || at_tok_nextint(&line, &len) < 0
++            || at_tok_nextstr(&line, &(sr.simResponse)) < 0) {
++        err = RIL_E_GENERIC_FAILURE;
++        goto error;
++    }
++
++    sscanf(&(sr.simResponse[len - 4]), "%02x%02x", &(sr.sw1), &(sr.sw2));
++    sr.simResponse[len - 4] = '\0';
++
++    RIL_onRequestComplete(t, RIL_E_SUCCESS, &sr, sizeof(sr));
+     at_response_free(p_response);
+     free(cmd);
+ 
++    // end sim toolkit session if 90 00 on TERMINAL RESPONSE
++    if((p_args->instruction == 20) && (sr.sw1 == 0x90))
++        RIL_onUnsolicitedResponse(RIL_UNSOL_STK_SESSION_END, NULL, 0);
++
++    // return if no sim toolkit proactive command is ready
++    if(sr.sw1 != 0x91)
++        return;
++
++fetch:
++    asprintf(&cmd, "AT+CSIM=10,\"a0120000%02x\"", sr.sw2);
++    err = at_send_command_singleline(cmd, "+CSIM:", &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        goto fetch_error;
++    }
++
++    line = p_response->p_intermediates->line;
++
++    err = at_tok_start(&line);
++    if (err < 0) goto fetch_error;
++
++    err = at_tok_nextint(&line, &len);
++    if (err < 0) goto fetch_error;
++
++    err = at_tok_nextstr(&line, &(sr.simResponse));
++    if (err < 0) goto fetch_error;
++
++    sscanf(&(sr.simResponse[len - 4]), "%02x%02x", &(sr.sw1), &(sr.sw2));
++    sr.simResponse[len - 4] = '\0';
++
++    RIL_onUnsolicitedResponse(RIL_UNSOL_STK_PROACTIVE_COMMAND, sr.simResponse, strlen(sr.simResponse));
++
++    goto fetch_error;
++error:
++    RIL_onRequestComplete(t, err, NULL, 0);
++fetch_error:
++    at_response_free(p_response);
++    free(cmd);
++}
++
++static void  requestSIM_GetAtr(RIL_Token t)
++{
++    ATResponse *p_response = NULL;
++    int err;
++    char *line;
++    char *response;
++
++    err = at_send_command_singleline("AT+CATR", "+CATR:", &p_response);
++
++    if (err < 0 || p_response->success == 0) {
++        if (!strcmp(p_response->finalResponse, "+CME ERROR: ATR NOT FOUND")) {
++            err = RIL_E_MISSING_RESOURCE;
++        }
++        else {
++            err = RIL_E_GENERIC_FAILURE;
++        }
++        goto error;
++    }
++
++    line = p_response->p_intermediates->line;
++
++    err = RIL_E_GENERIC_FAILURE;
++    if (at_tok_start(&line) < 0) goto error;
++    if (at_tok_nextstr(&line, &response) < 0) goto error;
++
++    RIL_onRequestComplete(t, RIL_E_SUCCESS, response, strlen(response));
++    at_response_free(p_response);
++
++    return;
++error:
++    RIL_onRequestComplete(t, err, NULL, 0);
++    at_response_free(p_response);
+ }
+ 
+ static void  requestEnterSimPin(void*  data, size_t  datalen, RIL_Token  t)
+@@ -2192,10 +2728,68 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
+             at_response_free(p_response);
+             break;
+ 
++        case RIL_REQUEST_STK_SET_PROFILE:
++        case RIL_REQUEST_STK_GET_PROFILE:
++        case RIL_REQUEST_STK_HANDLE_CALL_SETUP_REQUESTED_FROM_SIM:
++            RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
++            break;
++
++        case RIL_REQUEST_STK_SEND_ENVELOPE_COMMAND:
++            {
++                RIL_SIM_APDU apdu;
++                apdu.cla = 0xa0;
++                apdu.instruction = 194;
++                apdu.p1 = 0;
++                apdu.p2 = 0;
++                apdu.p3 = strlen(data) >> 1;
++                apdu.data = data;
++
++                requestSIM_TransmitBasic(&apdu, 0, t);
++            }
++            break;
++
++        case RIL_REQUEST_STK_SEND_TERMINAL_RESPONSE:
++            {
++                RIL_SIM_APDU apdu;
++                apdu.cla = 0xa0;
++                apdu.instruction = 20;
++                apdu.p1 = 0;
++                apdu.p2 = 0;
++                apdu.p3 = strlen(data) >> 1;
++                apdu.data = data;
++
++                requestSIM_TransmitBasic(&apdu, 0, t);
++            }
++            break;
++
+         case RIL_REQUEST_SIM_IO:
+             requestSIM_IO(data,datalen,t);
+             break;
+ 
++        case RIL_REQUEST_SIM_TRANSMIT_APDU_BASIC:
++            requestSIM_TransmitBasic(data, datalen, t);
++            break;
++
++        case RIL_REQUEST_SIM_OPEN_CHANNEL:
++            requestSIM_OpenChannel(data, datalen, t);
++            break;
++
++        case RIL_REQUEST_SIM_CLOSE_CHANNEL:
++            requestSIM_CloseChannel(data, datalen, t);
++            break;
++
++        case RIL_REQUEST_SIM_TRANSMIT_APDU_CHANNEL:
++            requestSIM_TransmitChannel(data, datalen, t);
++            break;
++
++        case RIL_REQUEST_SIM_GET_ATR:
++            requestSIM_GetAtr(t);
++            break;
++
++        case RIL_REQUEST_SIM_OPEN_CHANNEL_WITH_P2:
++            requestSIM_OpenChannel_WITH_P2(data, datalen, t);
++            break;
++
+         case RIL_REQUEST_SEND_USSD:
+             requestSendUSSD(data, datalen, t);
+             break;

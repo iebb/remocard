@@ -1,0 +1,465 @@
+diff --git a/frameworks/base/telephony/java/android/telephony/TelephonyManager.java b/frameworks/base/telephony/java/android/telephony/TelephonyManager.java
+index 6ba151f..14a30fc 100644
+--- a/frameworks/base/telephony/java/android/telephony/TelephonyManager.java
++++ b/frameworks/base/telephony/java/android/telephony/TelephonyManager.java
+@@ -2396,6 +2396,25 @@ public class TelephonyManager {
+     }
+ 
+     /**
++     * Opens a logical channel to the ICC card.
++     *
++     * <p>Requires Permission:
++     *   {@link android.Manifest.permission#MODIFY_PHONE_STATE MODIFY_PHONE_STATE}
++     *
++     * @param AID Application id. See ETSI 102.221 and 101.220.
++     * @param p2 byte.
++     * @return an IccOpenLogicalChannelResponse object.
++     */
++    public IccOpenLogicalChannelResponse iccOpenLogicalChannel(String AID, byte p2) {
++        try {
++            return getITelephony().iccOpenLogicalChannelP2(AID, p2);
++        } catch (RemoteException ex) {
++        } catch (NullPointerException ex) {
++        }
++        return null;
++    }
++
++    /**
+      * Closes a previously opened logical channel to the ICC card.
+      *
+      * Input parameters equivalent to TS 27.007 AT+CCHC command.
+@@ -2502,6 +2521,19 @@ public class TelephonyManager {
+     }
+ 
+     /**
++     * Returns the ATR of the UICC if available.
++     *
++     * @return The ATR of the UICC if available.
++     */
++    public String iccGetAtr() {
++        try {
++            return getITelephony().iccGetAtr();
++        } catch (RemoteException e) {
++        }
++        return null;
++    }
++
++    /**
+      * Send ENVELOPE to the SIM and return the response.
+      *
+      * <p>Requires Permission:
+diff --git a/frameworks/base/telephony/java/com/android/internal/telephony/ITelephony.aidl b/frameworks/base/telephony/java/com/android/internal/telephony/ITelephony.aidl
+index 0868f41..60c0c6c 100644
+--- a/frameworks/base/telephony/java/com/android/internal/telephony/ITelephony.aidl
++++ b/frameworks/base/telephony/java/com/android/internal/telephony/ITelephony.aidl
+@@ -505,6 +505,14 @@ interface ITelephony {
+     IccOpenLogicalChannelResponse iccOpenLogicalChannel(String AID);
+ 
+     /**
++     * Opens a logical channel to the ICC card.
++     *
++     * @param AID Application id. See ETSI 102.221 and 101.220.
++     * @return an IccOpenLogicalChannelResponse object.
++     */
++    IccOpenLogicalChannelResponse iccOpenLogicalChannelP2(String AID, byte p2);
++
++    /**
+      * Closes a previously opened logical channel to the ICC card.
+      *
+      * Input parameters equivalent to TS 27.007 AT+CCHC command.
+@@ -568,6 +576,11 @@ interface ITelephony {
+             String filePath);
+ 
+     /**
++     * Returns the ATR of the UICC as a Hex String.
++     */
++    String iccGetAtr();
++
++    /**
+      * Send ENVELOPE to the SIM and returns the response.
+      *
+      * @param contents  String containing SAT/USAT response in hexadecimal
+diff --git a/frameworks/base/telephony/java/com/android/internal/telephony/RILConstants.java b/frameworks/base/telephony/java/com/android/internal/telephony/RILConstants.java
+index e730bde..3372ed9 100644
+--- a/frameworks/base/telephony/java/com/android/internal/telephony/RILConstants.java
++++ b/frameworks/base/telephony/java/com/android/internal/telephony/RILConstants.java
+@@ -291,6 +291,8 @@ cat include/telephony/ril.h | \
+     int RIL_REQUEST_SET_DC_RT_INFO_RATE = 127;
+     int RIL_REQUEST_SET_DATA_PROFILE = 128;
+     int RIL_REQUEST_SHUTDOWN = 129;
++    int RIL_REQUEST_SIM_GET_ATR = 130;
++    int RIL_REQUEST_SIM_OPEN_CHANNEL_WITH_P2 = 131;
+ 
+     int RIL_UNSOL_RESPONSE_BASE = 1000;
+     int RIL_UNSOL_RESPONSE_RADIO_STATE_CHANGED = 1000;
+diff --git a/frameworks/opt/telephony/src/java/com/android/internal/telephony/CommandsInterface.java b/frameworks/opt/telephony/src/java/com/android/internal/telephony/CommandsInterface.java
+index ea34c8c..e5cf740 100644
+--- a/frameworks/opt/telephony/src/java/com/android/internal/telephony/CommandsInterface.java
++++ b/frameworks/opt/telephony/src/java/com/android/internal/telephony/CommandsInterface.java
+@@ -1770,6 +1770,15 @@ public interface CommandsInterface {
+     public void iccOpenLogicalChannel(String AID, Message response);
+ 
+     /**
++     * Open a logical channel to the SIM.
++     *
++     * @param AID Application id. See ETSI 102.221 and 101.220.
++     * @param response Callback message. response.obj will be an int [1] with
++     *            element [0] set to the id of the logical channel.
++     */
++    public void iccOpenLogicalChannel(String AID, byte p2, Message response);
++
++    /**
+      * Close a previously opened logical channel to the SIM.
+      *
+      * Input parameters equivalent to TS 27.007 AT+CCHC command.
+@@ -1818,6 +1827,13 @@ public interface CommandsInterface {
+             int p3, String data, Message response);
+ 
+     /**
++     * Retrieve the SIM ATR.
++     *
++     * @param response Callback message. response.obj.userObj will be a String on success.
++     */
++    void iccGetAtr(Message response);
++
++    /**
+      * Read one of the NV items defined in {@link RadioNVItems} / {@code ril_nv_items.h}.
+      * Used for device configuration by some CDMA operators.
+      *
+diff --git a/frameworks/opt/telephony/src/java/com/android/internal/telephony/RIL.java b/frameworks/opt/telephony/src/java/com/android/internal/telephony/RIL.java
+index f59e883..d36f286 100644
+--- a/frameworks/opt/telephony/src/java/com/android/internal/telephony/RIL.java
++++ b/frameworks/opt/telephony/src/java/com/android/internal/telephony/RIL.java
+@@ -262,7 +262,7 @@ public final class RIL extends BaseCommands implements CommandsInterface {
+     //***** Constants
+ 
+     // match with constant in ril.cpp
+-    static final int RIL_MAX_COMMAND_BYTES = (8 * 1024);
++    static final int RIL_MAX_COMMAND_BYTES = (8 * 0xFFFF);
+     static final int RESPONSE_SOLICITED = 0;
+     static final int RESPONSE_UNSOLICITED = 1;
+ 
+@@ -345,7 +345,8 @@ public final class RIL extends BaseCommands implements CommandsInterface {
+                         }
+ 
+                         // parcel length in big endian
+-                        dataLength[0] = dataLength[1] = 0;
++                        dataLength[0] = (byte)((data.length >> 24) & 0xff);
++                        dataLength[1] = (byte)((data.length >> 16) & 0xff);
+                         dataLength[2] = (byte)((data.length >> 8) & 0xff);
+                         dataLength[3] = (byte)((data.length) & 0xff);
+ 
+@@ -2537,8 +2538,10 @@ public final class RIL extends BaseCommands implements CommandsInterface {
+             case RIL_REQUEST_IMS_SEND_SMS: ret =  responseSMS(p); break;
+             case RIL_REQUEST_SIM_TRANSMIT_APDU_BASIC: ret =  responseICC_IO(p); break;
+             case RIL_REQUEST_SIM_OPEN_CHANNEL: ret  = responseInts(p); break;
++            case RIL_REQUEST_SIM_OPEN_CHANNEL_WITH_P2: ret  = responseInts(p); break;
+             case RIL_REQUEST_SIM_CLOSE_CHANNEL: ret  = responseVoid(p); break;
+             case RIL_REQUEST_SIM_TRANSMIT_APDU_CHANNEL: ret = responseICC_IO(p); break;
++            case RIL_REQUEST_SIM_GET_ATR: ret = responseString(p); break;
+             case RIL_REQUEST_NV_READ_ITEM: ret = responseString(p); break;
+             case RIL_REQUEST_NV_WRITE_ITEM: ret = responseVoid(p); break;
+             case RIL_REQUEST_NV_WRITE_CDMA_PRL: ret = responseVoid(p); break;
+@@ -2630,6 +2633,7 @@ public final class RIL extends BaseCommands implements CommandsInterface {
+             case RIL_REQUEST_GET_IMEI:
+             case RIL_REQUEST_GET_IMEISV:
+             case RIL_REQUEST_SIM_OPEN_CHANNEL:
++            case RIL_REQUEST_SIM_OPEN_CHANNEL_WITH_P2:
+             case RIL_REQUEST_SIM_TRANSMIT_APDU_CHANNEL:
+ 
+                 if (!RILJ_LOGV) {
+@@ -3977,8 +3981,10 @@ public final class RIL extends BaseCommands implements CommandsInterface {
+             case RIL_REQUEST_IMS_SEND_SMS: return "RIL_REQUEST_IMS_SEND_SMS";
+             case RIL_REQUEST_SIM_TRANSMIT_APDU_BASIC: return "RIL_REQUEST_SIM_TRANSMIT_APDU_BASIC";
+             case RIL_REQUEST_SIM_OPEN_CHANNEL: return "RIL_REQUEST_SIM_OPEN_CHANNEL";
++            case RIL_REQUEST_SIM_OPEN_CHANNEL_WITH_P2: return "RIL_REQUEST_SIM_OPEN_CHANNEL_WITH_P2";
+             case RIL_REQUEST_SIM_CLOSE_CHANNEL: return "RIL_REQUEST_SIM_CLOSE_CHANNEL";
+             case RIL_REQUEST_SIM_TRANSMIT_APDU_CHANNEL: return "RIL_REQUEST_SIM_TRANSMIT_APDU_CHANNEL";
++            case RIL_REQUEST_SIM_GET_ATR: return "RIL_REQUEST_SIM_GET_ATR";
+             case RIL_REQUEST_NV_READ_ITEM: return "RIL_REQUEST_NV_READ_ITEM";
+             case RIL_REQUEST_NV_WRITE_ITEM: return "RIL_REQUEST_NV_WRITE_ITEM";
+             case RIL_REQUEST_NV_WRITE_CDMA_PRL: return "RIL_REQUEST_NV_WRITE_CDMA_PRL";
+@@ -4415,6 +4421,21 @@ public final class RIL extends BaseCommands implements CommandsInterface {
+      * {@inheritDoc}
+      */
+     @Override
++    public void iccOpenLogicalChannel(String AID, byte p2, Message response) {
++        RILRequest rr = RILRequest.obtain(RIL_REQUEST_SIM_OPEN_CHANNEL_WITH_P2, response);
++        rr.mParcel.writeInt(2);
++        rr.mParcel.writeString(AID);
++        rr.mParcel.writeString(Integer.toHexString(0x100 + (p2 & 0xff)).substring(1));
++        if (RILJ_LOGD)
++            riljLog(rr.serialString() + "> " + requestToString(rr.mRequest));
++
++        send(rr);
++    }
++
++    /**
++     * {@inheritDoc}
++     */
++    @Override
+     public void iccCloseLogicalChannel(int channel, Message response) {
+         RILRequest rr = RILRequest.obtain(RIL_REQUEST_SIM_CLOSE_CHANNEL, response);
+         rr.mParcel.writeInt(1);
+@@ -4471,6 +4492,18 @@ public final class RIL extends BaseCommands implements CommandsInterface {
+         send(rr);
+     }
+ 
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public void iccGetAtr(Message result) {
++        RILRequest rr = RILRequest.obtain(RIL_REQUEST_SIM_GET_ATR, result);
++        if (RILJ_LOGD)
++            riljLog(rr.serialString() + "> " + requestToString(rr.mRequest));
++
++        send(rr);
++    }
++
+     @Override
+     public void nvReadItem(int itemID, Message response) {
+         RILRequest rr = RILRequest.obtain(RIL_REQUEST_NV_READ_ITEM, response);
+diff --git a/frameworks/opt/telephony/src/java/com/android/internal/telephony/imsphone/ImsPhoneCommandInterface.java b/frameworks/opt/telephony/src/java/com/android/internal/telephony/imsphone/ImsPhoneCommandInterface.java
+index 6f8f81d..9a9f0fd 100644
+--- a/frameworks/opt/telephony/src/java/com/android/internal/telephony/imsphone/ImsPhoneCommandInterface.java
++++ b/frameworks/opt/telephony/src/java/com/android/internal/telephony/imsphone/ImsPhoneCommandInterface.java
+@@ -571,6 +571,9 @@ class ImsPhoneCommandInterface extends BaseCommands implements CommandsInterface
+     public void iccOpenLogicalChannel(String AID, Message response) {}
+ 
+     @Override
++    public void iccOpenLogicalChannel(String AID, byte p2, Message response) {}
++
++    @Override
+     public void iccCloseLogicalChannel(int channel, Message response) {}
+ 
+     @Override
+@@ -582,6 +585,9 @@ class ImsPhoneCommandInterface extends BaseCommands implements CommandsInterface
+                                             int p3, String data, Message response) {}
+ 
+     @Override
++    public void iccGetAtr(Message response) {}
++
++    @Override
+     public void nvReadItem(int itemID, Message response) {}
+ 
+     @Override
+diff --git a/frameworks/opt/telephony/src/java/com/android/internal/telephony/sip/SipCommandInterface.java b/frameworks/opt/telephony/src/java/com/android/internal/telephony/sip/SipCommandInterface.java
+index 889cc8f..cf1f6c3 100644
+--- a/frameworks/opt/telephony/src/java/com/android/internal/telephony/sip/SipCommandInterface.java
++++ b/frameworks/opt/telephony/src/java/com/android/internal/telephony/sip/SipCommandInterface.java
+@@ -574,6 +574,10 @@ class SipCommandInterface extends BaseCommands implements CommandsInterface {
+     }
+ 
+     @Override
++    public void iccOpenLogicalChannel(String AID, byte p2, Message response) {
++    }
++
++    @Override
+     public void iccCloseLogicalChannel(int channel, Message response) {
+     }
+ 
+@@ -588,6 +592,10 @@ class SipCommandInterface extends BaseCommands implements CommandsInterface {
+     }
+ 
+     @Override
++    public void iccGetAtr(Message response) {
++    }
++
++    @Override
+     public void nvReadItem(int itemID, Message response) {
+     }
+ 
+diff --git a/frameworks/opt/telephony/src/java/com/android/internal/telephony/test/SimulatedCommands.java b/frameworks/opt/telephony/src/java/com/android/internal/telephony/test/SimulatedCommands.java
+index dd0ae43..1018c74 100644
+--- a/frameworks/opt/telephony/src/java/com/android/internal/telephony/test/SimulatedCommands.java
++++ b/frameworks/opt/telephony/src/java/com/android/internal/telephony/test/SimulatedCommands.java
+@@ -1708,6 +1708,11 @@ public final class SimulatedCommands extends BaseCommands
+     }
+ 
+     @Override
++    public void iccOpenLogicalChannel(String AID, byte p2, Message response) {
++        unimplemented(response);
++    }
++
++    @Override
+     public void iccCloseLogicalChannel(int channel, Message response) {
+         unimplemented(response);
+     }
+@@ -1725,6 +1730,9 @@ public final class SimulatedCommands extends BaseCommands
+     }
+ 
+     @Override
++    public void iccGetAtr(Message response) { unimplemented(response); }
++
++    @Override
+     public void nvReadItem(int itemID, Message response) {
+         unimplemented(response);
+     }
+diff --git a/frameworks/opt/telephony/src/java/com/android/internal/telephony/uicc/UiccCard.java b/frameworks/opt/telephony/src/java/com/android/internal/telephony/uicc/UiccCard.java
+index 9b27fb2..f3a5fdf 100644
+--- a/frameworks/opt/telephony/src/java/com/android/internal/telephony/uicc/UiccCard.java
++++ b/frameworks/opt/telephony/src/java/com/android/internal/telephony/uicc/UiccCard.java
+@@ -475,6 +475,14 @@ public class UiccCard {
+     }
+ 
+     /**
++     * Exposes {@link CommandsInterface.iccOpenLogicalChannel}
++     */
++    public void iccOpenLogicalChannel(String AID, byte p2, Message response) {
++        mCi.iccOpenLogicalChannel(AID, p2,
++                mHandler.obtainMessage(EVENT_OPEN_LOGICAL_CHANNEL_DONE, response));
++    }
++
++    /**
+      * Exposes {@link CommandsInterface.iccCloseLogicalChannel}
+      */
+     public void iccCloseLogicalChannel(int channel, Message response) {
+@@ -510,6 +518,13 @@ public class UiccCard {
+     }
+ 
+     /**
++     * Exposes {@link CommandsInterface.iccGetAtr}
++     * @param response
++     */
++    public void iccGetAtr(Message response) {
++        mCi.iccGetAtr(response);
++    }
++    /**
+      * Exposes {@link CommandsInterface.sendEnvelopeWithStatus}
+      */
+     public void sendEnvelopeWithStatus(String contents, Message response) {
+diff --git a/frameworks/opt/telephony/src/java/com/android/internal/telephony/uicc/UiccController.java b/frameworks/opt/telephony/src/java/com/android/internal/telephony/uicc/UiccController.java
+index c998934..0163e42 100644
+--- a/frameworks/opt/telephony/src/java/com/android/internal/telephony/uicc/UiccController.java
++++ b/frameworks/opt/telephony/src/java/com/android/internal/telephony/uicc/UiccController.java
+@@ -144,7 +144,8 @@ public class UiccController extends Handler {
+     }
+ 
+     public UiccCard getUiccCard() {
+-        return getUiccCard(SubscriptionController.getInstance().getPhoneId(SubscriptionController.getInstance().getDefaultSubId()));
++        // TODO: check why SubscriptionManager.getDefaultSubId() returns SubscriptionManager.INVALID_SUB_ID
++        return getUiccCard(0);
+     }
+ 
+     public UiccCard getUiccCard(int slotId) {
+diff --git a/packages/services/Telephony/src/com/android/phone/PhoneInterfaceManager.java b/packages/services/Telephony/src/com/android/phone/PhoneInterfaceManager.java
+index 26e31b0..82f49bc 100644
+--- a/packages/services/Telephony/src/com/android/phone/PhoneInterfaceManager.java
++++ b/packages/services/Telephony/src/com/android/phone/PhoneInterfaceManager.java
+@@ -120,6 +120,11 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
+     private static final int EVENT_TRANSMIT_APDU_BASIC_CHANNEL_DONE = 30;
+     private static final int CMD_EXCHANGE_SIM_IO = 31;
+     private static final int EVENT_EXCHANGE_SIM_IO_DONE = 32;
++    private static final int CMD_GET_ATR = 33;
++    private static final int EVENT_GET_ATR_DONE = 34;
++    private static final int CMD_OPEN_CHANNEL_WITH_P2 = 35;
++    // No need to declare EVENT_OPEN_CHANNEL_OPEN_WITH_P2_DONE,
++    // we reuse EVENT_OPEN_CHANNEL_DONE
+ 
+     /** The singleton instance. */
+     private static PhoneInterfaceManager sInstance;
+@@ -372,6 +377,32 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
+                     }
+                     break;
+ 
++                case CMD_GET_ATR:
++                    request = (MainThreadRequest) msg.obj;
++                    if (uiccCard == null) {
++                        loge("iccGetAtr: No UICC");
++                        synchronized (request) {
++                            request.notifyAll();
++                        }
++                    } else {
++                        onCompleted = obtainMessage(EVENT_GET_ATR_DONE, request);
++                        uiccCard.iccGetAtr(onCompleted);
++                    }
++                    break;
++     
++                case EVENT_GET_ATR_DONE:
++                    ar = (AsyncResult) msg.obj;
++                    request = (MainThreadRequest) ar.userObj;
++                    if (ar.exception == null && ar.result != null) {
++                        request.result = (String) ar.result;
++                    } else {
++                        request.result = "";
++                    }
++                    synchronized (request) {
++                        request.notifyAll();
++                    }
++                    break;
++     
+                 case CMD_SEND_ENVELOPE:
+                     request = (MainThreadRequest) msg.obj;
+                     if (uiccCard == null) {
+@@ -421,6 +452,21 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
+                     }
+                     break;
+ 
++                case CMD_OPEN_CHANNEL_WITH_P2:
++                    request = (MainThreadRequest) msg.obj;
++                    if (uiccCard == null) {
++                        loge("iccOpenLogicalChannel: No UICC");
++                        request.result = new IccIoResult(0x6F, 0, (byte[])null);
++                        synchronized (request) {
++                            request.notifyAll();
++                        }
++                    } else {
++                        onCompleted = obtainMessage(EVENT_OPEN_CHANNEL_DONE, request);
++                        Pair<String, Byte> aidByteValue = (Pair<String, Byte>) request.argument;
++                        uiccCard.iccOpenLogicalChannel(aidByteValue.first, aidByteValue.second, onCompleted);
++                    }
++                    break;
++
+                 case EVENT_OPEN_CHANNEL_DONE:
+                     ar = (AsyncResult) msg.obj;
+                     request = (MainThreadRequest) ar.userObj;
+@@ -1590,7 +1636,6 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
+     @Override
+     public IccOpenLogicalChannelResponse iccOpenLogicalChannel(String AID) {
+         enforceModifyPermissionOrCarrierPrivilege();
+-
+         if (DBG) log("iccOpenLogicalChannel: " + AID);
+         IccOpenLogicalChannelResponse response = (IccOpenLogicalChannelResponse)sendRequest(
+             CMD_OPEN_CHANNEL, AID);
+@@ -1599,6 +1644,16 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
+     }
+ 
+     @Override
++    public IccOpenLogicalChannelResponse iccOpenLogicalChannelP2(String AID, byte p2) {
++        enforceModifyPermissionOrCarrierPrivilege();
++        if (DBG) log("iccOpenLogicalChannel: " + AID);
++        IccOpenLogicalChannelResponse response = (IccOpenLogicalChannelResponse)sendRequest(
++                CMD_OPEN_CHANNEL_WITH_P2, new Pair<String, Byte>(AID, p2));
++        if (DBG) log("iccOpenLogicalChannel: " + response);
++        return response;
++    }
++
++    @Override
+     public boolean iccCloseLogicalChannel(int channel) {
+         enforceModifyPermissionOrCarrierPrivilege();
+ 
+@@ -1696,6 +1751,23 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
+     }
+ 
+     @Override
++    public String iccGetAtr() throws RemoteException {
++        enforceModifyPermissionOrCarrierPrivilege();
++     
++        if (DBG) {
++            log("iccGetAtr");
++        }
++     
++        String response = (String) sendRequest(CMD_GET_ATR, null);
++     
++        if (DBG) {
++            log("iccGetAtr [R]: " + response);
++        }
++     
++        return response;
++    }
++     
++    @Override
+     public String sendEnvelopeWithStatus(String content) {
+         enforceModifyPermissionOrCarrierPrivilege();
+
